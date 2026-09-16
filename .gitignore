@@ -1,0 +1,32 @@
+# secrets and local env — never commit live values
+.env
+.env.*
+!.env.example
+*.pem
+client_secret*.json
+token*.json
+credentials*.json
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# runtime
+*.log
+logs/
+
+# proofs, sheets, inbox working files
+*.jpg
+*.jpeg
+*.png
+*.heic
+*.heif
+*.webp
+*.pdf
+*.xlsx
+*.xls
+inbox/
+work/
+data/
