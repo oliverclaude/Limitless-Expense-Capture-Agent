@@ -5,8 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=limitless-expense-capture-agent
+Group=limitless-expense-capture-agent
 EnvironmentFile=/etc/expense-agent/env
 # AGENT_HOME in that env file is the git checkout on the LXC.
+# Env file must be readable by this user (e.g. root:limitless-expense-capture-agent 640).
 ExecStart=/usr/bin/env bash -c 'cd "${AGENT_HOME:?set AGENT_HOME in /etc/expense-agent/env}" && exec .venv/bin/python agent.py --loop'
 Restart=on-failure
 RestartSec=60
