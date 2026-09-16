@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Slice 3: poll one CLAIM: message, save original proof, crop photo if possible.
+"""Slice 4: poll one CLAIM: message, save proof, crop, extract fields.
 
-Leaves the message unread. Does not extract fields, ntfy, or reply.
+Leaves the message unread. Does not write the xlsx, ntfy, or reply.
 """
 
 from __future__ import annotations
@@ -229,6 +229,49 @@ def find_latest_claim(imap: imaplib.IMAP4) -> tuple[bytes, Message] | None:
     return None
 
 
+def text_body(msg: Message) -> str:
+    chunks: list[str] = []
+    for part in iter_file_parts(msg):
+        if part.get_content_type() != "text/plain":
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        chunks.append(bytes(payload).decode(charset, errors="replace"))
+    if chunks:
+        return "\n".join(chunks).strip()
+    if not msg.is_multipart():
+        payload = msg.get_payload(decode=True)
+        if payload and (msg.get_content_type() or "").startswith("text/"):
+            charset = msg.get_content_charset() or "utf-8"
+            return bytes(payload).decode(charset, errors="replace").strip()
+    return ""
+
+
+def print_extraction(fields: dict) -> None:
+    from extract import format_money
+
+    print("claim date:", fields.get("claim_date") or "(missing)")
+    personal = fields.get("personal_amount")
+    company = fields.get("company_amount")
+    vat = fields.get("vat")
+    print(f"personal: {personal if personal is not None else '(missing)'}")
+    print(f"company: {company if company is not None else '(missing)'}")
+    print(f"vat: {vat if vat is not None else '(missing)'}")
+    print("comment:", fields.get("comment") or "(none)")
+    print("journal:", fields.get("journal") or "(none)")
+    print("proof:", fields.get("proof_file") or "(none)")
+    print("confidence:", fields.get("confidence"))
+    status = "needs_review" if fields.get("needs_review") else "logged"
+    print("status:", status)
+    reasons = fields.get("review_reasons") or []
+    if reasons and fields.get("needs_review"):
+        print("review:", "; ".join(str(r) for r in reasons))
+    print("credits used:", format_money(fields.get("credits_used_usd")))
+    print("credits left:", format_money(fields.get("credits_left_usd")))
+
+
 def report(msg: Message) -> None:
     subject = decode_mime_header(msg.get("Subject"))
     date = decode_mime_header(msg.get("Date"))
@@ -303,12 +346,32 @@ def main() -> None:
             return
         _, msg = found
         report(msg)
+        from extract import extract_claim, journals_from_env
+
+        subject = decode_mime_header(msg.get("Subject"))
+        body = text_body(msg)
         for path in save_originals(msg, Path(str(cfg["expenses_root"]))):
             print(f"wrote: {path}")
             scan, status = save_scan(path)
             print(f"crop: {status}")
             if scan is not None:
                 print(f"wrote: {scan}")
+            image = scan if scan is not None else path
+            if image.suffix.lower() in PDF_SUFFIXES:
+                print("extract skipped (pdf not in this slice)")
+                continue
+            try:
+                fields = extract_claim(
+                    subject=subject,
+                    body=body,
+                    image_path=image,
+                    proof_name=(scan or path).name,
+                    journals=journals_from_env(),
+                )
+            except RuntimeError as exc:
+                print(f"extract failed: {exc}", file=sys.stderr)
+                sys.exit(1)
+            print_extraction(fields)
     except imaplib.IMAP4.error as exc:
         print(f"IMAP error: {exc}", file=sys.stderr)
         sys.exit(1)

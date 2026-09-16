@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+prepaid.json
+.prepaid.json
 *.pem
 client_secret*.json
 token*.json
