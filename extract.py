@@ -18,9 +18,26 @@ INFERENCE_URL = "https://api.x.ai/v1/responses"
 MANAGEMENT_BASE = "https://management-api.x.ai"
 
 
-def journals_from_env() -> list[str]:
-    raw = os.environ.get("JOURNALS", "Entertainment")
+def _csv_env(name: str, default: str = "") -> list[str]:
+    raw = os.environ.get(name, default)
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def journals_from_env() -> list[str]:
+    return _csv_env("JOURNALS", "Entertainment")
+
+
+def vat_journals_from_env() -> list[str]:
+    return _csv_env("VAT_JOURNALS", "")
+
+
+def apply_vat_policy(fields: dict[str, Any], vat_journals: list[str] | None = None) -> dict[str, Any]:
+    """Only journals on VAT_JOURNALS may claim VAT. Others get 0 (SA entertainment, etc.)."""
+    allowed = {name.lower() for name in (vat_journals if vat_journals is not None else vat_journals_from_env())}
+    journal = fields.get("journal")
+    if not isinstance(journal, str) or journal.lower() not in allowed:
+        fields["vat"] = 0.0
+    return fields
 
 
 def ticks_to_usd(ticks: int | float | None) -> float | None:
@@ -42,7 +59,8 @@ def extract_claim(
         raise RuntimeError("missing env: XAI_API_KEY")
     model = os.environ.get("XAI_MODEL", "").strip() or DEFAULT_MODEL
     image_b64, mime = _image_data(image_path)
-    prompt = _prompt(subject, body, journals)
+    vat_journals = vat_journals_from_env()
+    prompt = _prompt(subject, body, journals, vat_journals)
     payload = {
         "model": model,
         "input": [
@@ -62,6 +80,7 @@ def extract_claim(
     data = _post_json(INFERENCE_URL, payload, api_key)
     text = _output_text(data)
     fields = _parse_fields(text, journals, subject)
+    apply_vat_policy(fields, vat_journals)
     fields["proof_file"] = proof_name
     usage = data.get("usage") or {}
     fields["credits_used_usd"] = ticks_to_usd(usage.get("cost_in_usd_ticks"))
@@ -112,8 +131,11 @@ def _is_noise_reason(reason: str) -> bool:
     return False
 
 
-def _prompt(subject: str, body: str, journals: list[str]) -> str:
+def _prompt(subject: str, body: str, journals: list[str], vat_journals: list[str] | None = None) -> str:
     journal_list = ", ".join(journals) if journals else "(none configured)"
+    if vat_journals is None:
+        vat_journals = vat_journals_from_env()
+    vat_list = ", ".join(vat_journals) if vat_journals else "(none — no journal may claim VAT)"
     today = date.today().isoformat()
     return f"""You extract a South African expense claim. Return JSON only, no markdown.
 
@@ -128,7 +150,8 @@ Rules:
 - If the note does not say whose account paid, the WHOLE amount is personal_amount and company_amount is 0.
 - "My half" (or similar) means a third party paid the other half. personal_amount is the operator's half. company_amount is 0. Do not put the other half in either amount.
 - If the slip has a handwritten total or tip (for example Total: R130 next to a printed Total Incl. R118), the handwritten figure is the amount spent. Use it. Do not set needs_review for printed total vs handwritten tip.
-- vat: VAT amount only if printed on the slip or stated in the note. Keep the printed VAT even when a tip is added. Never calculate VAT from a rate unless the slip already shows the VAT figure.
+- vat: claimable VAT only. If the chosen journal is not in this list, vat MUST be 0 even if the slip prints VAT (South Africa: entertainment is not VAT-claimable): {vat_list}
+- If the journal IS on that list, copy VAT only if printed on the slip or stated in the note. Keep that printed VAT even when a tip is added. Never calculate VAT from a rate unless the slip already shows the VAT figure.
 - currency: ZAR unless another currency is explicit.
 - comment: 2–5 words, the purpose from the subject after CLAIM: (drop leading "Slip for" / "Invoice for"). Example: "Client Drinks". Do not summarise the merchant, mall, or amounts.
 - journal: MUST be exactly one of these, or null if none fit: {journal_list}

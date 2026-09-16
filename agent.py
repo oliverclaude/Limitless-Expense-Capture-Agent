@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Slice 4: poll one CLAIM: message, save proof, crop, extract fields.
+"""Slice 5: extract fields; VAT only for journals listed in VAT_JOURNALS.
 
 Leaves the message unread. Does not write the xlsx, ntfy, or reply.
 """
