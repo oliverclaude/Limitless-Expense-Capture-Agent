@@ -32,7 +32,7 @@ def straighten_slip(path: Path) -> tuple[bytes | None, str]:
     full_quad = quad / scale
     h, w = image.shape[:2]
     if _near_full_frame(full_quad, w, h):
-        out = _light_contrast(image)
+        out = image
         status = "contrast-only"
     else:
         warped = _four_point_transform(image, full_quad)
@@ -40,8 +40,13 @@ def straighten_slip(path: Path) -> tuple[bytes | None, str]:
             return None, "failed (bad warp)"
         if not _acceptable(warped):
             return None, "failed (poor crop)"
-        out = _light_contrast(warped)
+        out = warped
         status = "warped"
+
+    trimmed = _trim_to_content(out)
+    if _acceptable(trimmed):
+        out = trimmed
+    out = _light_contrast(out)
 
     jpeg = _encode_jpeg(out)
     if jpeg is None:
@@ -136,13 +141,15 @@ def _contour_quads(mask: np.ndarray, shape: tuple[int, ...]) -> list[np.ndarray]
 
 def _paper_masks(proc: np.ndarray) -> list[np.ndarray]:
     light = cv2.cvtColor(proc, cv2.COLOR_BGR2LAB)[:, :, 0]
-    otsu_t, otsu = cv2.threshold(light, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    percentile_t = float(np.percentile(light, 60))
-    relative = ((light >= max(otsu_t, percentile_t)).astype(np.uint8)) * 255
+    _, otsu = cv2.threshold(light, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
     open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     masks: list[np.ndarray] = []
-    for raw in (otsu, relative):
+    raw_masks = [otsu]
+    for percentile in (70.0, 75.0):
+        thresh = float(np.percentile(light, percentile))
+        raw_masks.append(((light >= thresh).astype(np.uint8)) * 255)
+    for raw in raw_masks:
         mask = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, close, iterations=2)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_k)
         masks.append(mask)
@@ -240,6 +247,43 @@ def _paper_min_rect(proc: np.ndarray, edges: np.ndarray) -> np.ndarray | None:
                 best_score = score
                 best = box
     return best
+
+
+def _peel_background(values: np.ndarray, ink: np.ndarray, paper_level: float, ink_floor: float) -> tuple[int, int]:
+    """Drop dark, ink-free margins only. Never eat a white receipt edge."""
+    n = len(values)
+    bg = (values < paper_level - 20.0) & (ink < ink_floor)
+    lo, hi = 0, n - 1
+    limit = int(0.4 * n)
+    while lo < limit and bg[lo]:
+        lo += 1
+    while hi > n - 1 - limit and bg[hi]:
+        hi -= 1
+    return lo, hi
+
+
+def _trim_to_content(warped: np.ndarray) -> np.ndarray:
+    """Peel leftover table/background after warp. Keep white paper margins."""
+    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 40, 120)
+    h, w = gray.shape
+    col_ink = edges.mean(axis=0)
+    row_ink = edges.mean(axis=1)
+    col_mean = gray.mean(axis=0)
+    row_mean = gray.mean(axis=1)
+    paper = float(np.percentile(col_mean, 65))
+    ink_floor = max(float(np.median(col_ink)) * 0.6, 3.0)
+    x0, x1 = _peel_background(col_mean, col_ink, paper, ink_floor)
+    y0, y1 = _peel_background(row_mean, row_ink, paper, ink_floor)
+    pad = 4
+    x0 = max(0, x0 - pad)
+    x1 = min(w, x1 + pad + 1)
+    y0 = max(0, y0 - pad)
+    y1 = min(h, y1 + pad + 1)
+    if x1 - x0 < 0.25 * w or y1 - y0 < 0.25 * h:
+        return warped
+    return warped[y0:y1, x0:x1]
 
 
 def _longest_true_run(flags: np.ndarray) -> tuple[int, int]:
