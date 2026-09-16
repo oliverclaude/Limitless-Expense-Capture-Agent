@@ -8,6 +8,7 @@ import os
 import re
 import urllib.error
 import urllib.request
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -60,7 +61,7 @@ def extract_claim(
     }
     data = _post_json(INFERENCE_URL, payload, api_key)
     text = _output_text(data)
-    fields = _parse_fields(text, journals)
+    fields = _parse_fields(text, journals, subject)
     fields["proof_file"] = proof_name
     usage = data.get("usage") or {}
     fields["credits_used_usd"] = ticks_to_usd(usage.get("cost_in_usd_ticks"))
@@ -88,12 +89,37 @@ def _image_data(path: Path) -> tuple[str, str]:
     return base64.b64encode(raw).decode("ascii"), mime
 
 
+def comment_from_subject(subject: str) -> str:
+    text = subject.strip()
+    if text.lower().startswith("claim:"):
+        text = text[6:].strip()
+    text = re.sub(r"^(slip|invoice|receipt|bill)\s+for\s+", "", text, flags=re.IGNORECASE).strip()
+    if not text:
+        return ""
+    return " ".join(word.capitalize() if word.islower() else word for word in text.split())
+
+
+def _is_noise_reason(reason: str) -> bool:
+    text = reason.lower()
+    if "future" in text:
+        return True
+    if "tip" in text:
+        return True
+    if "handwrit" in text and "printed" in text:
+        return True
+    if "printed" in text and ("claimed" in text or " vs " in text):
+        return True
+    return False
+
+
 def _prompt(subject: str, body: str, journals: list[str]) -> str:
     journal_list = ", ".join(journals) if journals else "(none configured)"
+    today = date.today().isoformat()
     return f"""You extract a South African expense claim. Return JSON only, no markdown.
 
 Use ALL of: the slip image, the email subject, and the email body (a free-text note to a clerk).
 Never invent amount, date, or VAT. If a value is not on the slip or in the note, use null.
+Today's date is {today}. A slip dated 2026 is not "in the future".
 
 Rules:
 - claim_date: calendar date on the slip/invoice (YYYY-MM-DD). Not the email date unless the slip date is unreadable — then null.
@@ -101,11 +127,12 @@ Rules:
 - company_amount: money spent from the company account.
 - If the note does not say whose account paid, the WHOLE amount is personal_amount and company_amount is 0.
 - "My half" (or similar) means a third party paid the other half. personal_amount is the operator's half. company_amount is 0. Do not put the other half in either amount.
-- vat: VAT amount only if printed on the slip or stated in the note. Never calculate VAT from a rate unless the slip already shows the VAT figure.
+- If the slip has a handwritten total or tip (for example Total: R130 next to a printed Total Incl. R118), the handwritten figure is the amount spent. Use it. Do not set needs_review for printed total vs handwritten tip.
+- vat: VAT amount only if printed on the slip or stated in the note. Keep the printed VAT even when a tip is added. Never calculate VAT from a rate unless the slip already shows the VAT figure.
 - currency: ZAR unless another currency is explicit.
-- comment: short clerk note combining useful subject text, body, merchant name, and anything to ignore.
+- comment: 2–5 words, the purpose from the subject after CLAIM: (drop leading "Slip for" / "Invoice for"). Example: "Client Drinks". Do not summarise the merchant, mall, or amounts.
 - journal: MUST be exactly one of these, or null if none fit: {journal_list}
-- needs_review: true if amount, date, or merchant is missing, journal is null, the note conflicts with the slip, or you are unsure.
+- needs_review: true only if amount, date, or merchant is missing, journal is null, or the note truly conflicts with the slip (not tip vs printed total).
 - confidence: high, medium, or low.
 
 Email subject:
@@ -179,7 +206,7 @@ def _output_text(data: dict[str, Any]) -> str:
     return "\n".join(chunks).strip()
 
 
-def _parse_fields(text: str, journals: list[str]) -> dict[str, Any]:
+def _parse_fields(text: str, journals: list[str], subject: str = "") -> dict[str, Any]:
     cleaned = text.strip()
     fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, re.DOTALL | re.IGNORECASE)
     if fenced:
@@ -209,7 +236,7 @@ def _parse_fields(text: str, journals: list[str]) -> dict[str, Any]:
     reasons = parsed.get("review_reasons") or []
     if not isinstance(reasons, list):
         reasons = [str(reasons)]
-    reasons = [str(r) for r in reasons]
+    reasons = [str(r) for r in reasons if not _is_noise_reason(str(r))]
 
     needs = bool(parsed.get("needs_review"))
     claim_date = parsed.get("claim_date")
@@ -224,9 +251,13 @@ def _parse_fields(text: str, journals: list[str]) -> dict[str, Any]:
         needs = True
         reasons.append("journal not in list")
 
-    comment = parsed.get("comment")
-    if not isinstance(comment, str):
-        comment = ""
+    if not reasons:
+        needs = False
+
+    comment = comment_from_subject(subject)
+    if not comment:
+        raw_comment = parsed.get("comment")
+        comment = raw_comment.strip() if isinstance(raw_comment, str) else ""
     merchant = parsed.get("merchant")
     if not isinstance(merchant, str) or not merchant.strip():
         merchant = None
