@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Slice 2: poll one CLAIM: message and save the original proof.
+"""Slice 3: poll one CLAIM: message, save original proof, crop photo if possible.
 
-Leaves the message unread. Does not crop, extract fields, ntfy, or reply.
+Leaves the message unread. Does not extract fields, ntfy, or reply.
 """
 
 from __future__ import annotations
@@ -242,6 +242,34 @@ def report(msg: Message) -> None:
     print(f"photo: {photo}")
 
 
+def scan_path_for(orig: Path) -> Path:
+    stem = orig.stem
+    if "_orig-" in stem:
+        stem = stem.replace("_orig-", "_scan-", 1)
+    elif stem.endswith("_orig"):
+        stem = stem[: -len("_orig")] + "_scan"
+    else:
+        stem = f"{stem}_scan"
+    return orig.with_name(stem + ".jpg")
+
+
+def save_scan(orig: Path) -> tuple[Path | None, str]:
+    if orig.suffix.lower() in PDF_SUFFIXES:
+        return None, "skipped (pdf)"
+    if orig.suffix.lower() not in PHOTO_SUFFIXES:
+        return None, "skipped"
+    try:
+        from crop import straighten_slip
+    except ImportError:
+        return None, "failed (install: pip install -r requirements.txt)"
+    jpeg, status = straighten_slip(orig)
+    if jpeg is None:
+        return None, status
+    dest = scan_path_for(orig)
+    atomic_write(dest, jpeg)
+    return dest, status
+
+
 def save_originals(msg: Message, root: Path) -> list[Path]:
     when = claim_date(msg)
     if when is None:
@@ -277,6 +305,10 @@ def main() -> None:
         report(msg)
         for path in save_originals(msg, Path(str(cfg["expenses_root"]))):
             print(f"wrote: {path}")
+            scan, status = save_scan(path)
+            print(f"crop: {status}")
+            if scan is not None:
+                print(f"wrote: {scan}")
     except imaplib.IMAP4.error as exc:
         print(f"IMAP error: {exc}", file=sys.stderr)
         sys.exit(1)
