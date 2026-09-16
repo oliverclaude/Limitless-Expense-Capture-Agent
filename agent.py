@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Slice 5: extract fields; VAT only for journals listed in VAT_JOURNALS.
+"""Slice 6: extract fields and append a row to YYYY-MM-Expenses.xlsx.
 
-Leaves the message unread. Does not write the xlsx, ntfy, or reply.
+Leaves the message unread. Does not ntfy or reply.
 """
 
 from __future__ import annotations
@@ -371,7 +371,15 @@ def main() -> None:
             except RuntimeError as exc:
                 print(f"extract failed: {exc}", file=sys.stderr)
                 sys.exit(1)
+            from sheet import confirm_proofs, month_sheet_path, write_claim_row
+
+            path, scan, proof_name = confirm_proofs(
+                path, scan, fields.get("claim_date"), fields.get("merchant")
+            )
+            fields["proof_file"] = proof_name
             print_extraction(fields)
+            sheet = write_claim_row(month_sheet_path(path.parent.parent), fields)
+            print(f"sheet: {sheet}")
     except imaplib.IMAP4.error as exc:
         print(f"IMAP error: {exc}", file=sys.stderr)
         sys.exit(1)
