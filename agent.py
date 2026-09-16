@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Slice 6: extract fields and append a row to YYYY-MM-Expenses.xlsx.
+"""Slice 7: ntfy on uncertainty; continue from English replies on the next run.
 
-Leaves the message unread. Does not ntfy or reply.
+Leaves the message unread. Does not send Done/Skipped email.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 import tempfile
@@ -21,6 +22,8 @@ import imaplib
 
 REQUIRED_ENV = ("IMAP_HOST", "IMAP_USER", "IMAP_PASSWORD")
 DEFAULT_EXPENSES_ROOT = "/g-drive"
+DEFAULT_STATE_DIR = "/g-drive/agent-state"
+DEFAULT_NTFY_TOPIC = "Limitless-Expense-Capture-Agent"
 PHOTO_SUFFIXES = (".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".gif", ".tif", ".tiff")
 PDF_SUFFIXES = (".pdf",)
 CONTENT_TYPE_EXT = {
@@ -72,12 +75,16 @@ def load_config() -> dict[str, str | int | Path]:
         sys.exit(2)
 
     root = os.environ.get("EXPENSES_ROOT", "").strip() or DEFAULT_EXPENSES_ROOT
+    state = os.environ.get("AGENT_STATE_DIR", "").strip() or DEFAULT_STATE_DIR
     return {
         "host": os.environ["IMAP_HOST"].strip(),
         "port": port,
         "user": os.environ["IMAP_USER"].strip(),
         "password": os.environ["IMAP_PASSWORD"],
         "expenses_root": Path(root),
+        "state_dir": Path(state),
+        "ntfy_url": os.environ.get("NTFY_URL", "").strip(),
+        "ntfy_topic": os.environ.get("NTFY_TOPIC", "").strip() or DEFAULT_NTFY_TOPIC,
     }
 
 
@@ -209,13 +216,27 @@ def atomic_write(dest: Path, data: bytes) -> None:
         raise
 
 
-def find_latest_claim(imap: imaplib.IMAP4) -> tuple[bytes, Message] | None:
+def message_key(msg: Message) -> str:
+    mid = decode_mime_header(msg.get("Message-ID")).strip()
+    if mid:
+        return mid
+    return f"{decode_mime_header(msg.get('Subject'))}|{decode_mime_header(msg.get('Date'))}"
+
+
+def claim_id_for(message_id: str) -> str:
+    return hashlib.sha256(message_id.encode("utf-8")).hexdigest()[:8]
+
+
+def find_latest_claim(imap: imaplib.IMAP4, skip_ids: set[str] | None = None) -> tuple[bytes, Message] | None:
+    skip_ids = skip_ids or set()
     typ, data = imap.search(None, "ALL")
     if typ != "OK" or not data or not data[0]:
         return None
     seqs = data[0].split()
     for seq in reversed(seqs):
-        raw_headers = fetch_part(imap, seq, "(BODY.PEEK[HEADER.FIELDS (SUBJECT DATE)])")
+        raw_headers = fetch_part(
+            imap, seq, "(BODY.PEEK[HEADER.FIELDS (SUBJECT DATE MESSAGE-ID)])"
+        )
         if not raw_headers:
             continue
         headers = parse_headers(raw_headers)
@@ -224,8 +245,11 @@ def find_latest_claim(imap: imaplib.IMAP4) -> tuple[bytes, Message] | None:
             continue
         raw_full = fetch_part(imap, seq, "(BODY.PEEK[])")
         if not raw_full:
-            return None
-        return seq, parse_headers(raw_full)
+            continue
+        msg = parse_headers(raw_full)
+        if message_key(msg) in skip_ids:
+            continue
+        return seq, msg
     return None
 
 
@@ -330,8 +354,124 @@ def save_originals(msg: Message, root: Path) -> list[Path]:
     return written
 
 
+def finish_logged(fields: dict, orig: Path) -> None:
+    from sheet import month_sheet_path, write_claim_row
+
+    sheet = write_claim_row(month_sheet_path(orig.parent.parent), fields)
+    print(f"sheet: {sheet}")
+
+
+def send_review_ping(cfg: dict, claim: dict, image: Path | None) -> None:
+    from ntfy import LECA_PREFIX, publish
+
+    url = str(cfg["ntfy_url"])
+    if not url:
+        print("ntfy skipped: NTFY_URL is empty", file=sys.stderr)
+        sys.exit(1)
+    claim_id = str(claim["id"])
+    reasons = "; ".join(claim.get("reasons") or []) or "needs review"
+    fields = claim.get("fields") or {}
+    message = (
+        f"{LECA_PREFIX}{claim_id}]\n"
+        f"{claim.get('subject')}\n"
+        f"{reasons}\n"
+        f"personal {fields.get('personal_amount')}  company {fields.get('company_amount')}  "
+        f"vat {fields.get('vat')}\n"
+        "Reply in English (ok, skip, merchant Woolies, that was my half)."
+    )
+    result = publish(
+        url,
+        str(cfg["ntfy_topic"]),
+        title="CLAIM needs review",
+        message=message,
+        image_path=image if image is not None and image.is_file() else None,
+    )
+    ntfy_id = str(result.get("id") or "")
+    ids = list(claim.get("ntfy_ids") or [])
+    if ntfy_id:
+        ids.append(ntfy_id)
+    claim["ntfy_ids"] = ids
+    print(f"ntfy: sent claim {claim_id}")
+
+
+def process_ntfy_replies(cfg: dict) -> None:
+    from extract import interpret_reply, journals_from_env
+    from ntfy import is_our_message, poll
+    import state as claim_state
+
+    url = str(cfg["ntfy_url"])
+    if not url:
+        return
+    root = Path(str(cfg["state_dir"]))
+    pending = claim_state.awaiting(root)
+    if not pending:
+        return
+    since = claim_state.load_cursor(root)
+    try:
+        messages = poll(url, str(cfg["ntfy_topic"]), since)
+    except RuntimeError as exc:
+        print(f"ntfy poll failed: {exc}", file=sys.stderr)
+        return
+    known = claim_state.known_ntfy_ids(root)
+    last_id = since
+    journals = journals_from_env()
+    for item in messages:
+        last_id = str(item.get("id") or last_id or "")
+        if is_our_message(item, known):
+            continue
+        text = str(item.get("message") or "").strip()
+        if not text:
+            continue
+        target = _match_pending(text, pending)
+        if target is None:
+            print(f"ntfy reply unmatched ({len(pending)} pending): {text[:80]}")
+            continue
+        print(f"ntfy reply for {target['id']}: {text}")
+        try:
+            result = interpret_reply(text, dict(target.get("fields") or {}), journals)
+        except RuntimeError as exc:
+            print(f"ntfy reply parse failed: {exc}", file=sys.stderr)
+            continue
+        action = result["action"]
+        fields = result["fields"]
+        target["fields"] = fields
+        if action == "skip":
+            target["status"] = "skipped"
+            claim_state.save_claim(root, target)
+            print(f"claim {target['id']}: skipped")
+            pending = [c for c in pending if c["id"] != target["id"]]
+            continue
+        orig = Path(str(target.get("orig_path") or ""))
+        if action == "update" and fields.get("needs_review"):
+            claim_state.save_claim(root, target)
+            print(f"claim {target['id']}: still needs review")
+            print_extraction(fields)
+            continue
+        if orig.is_file():
+            finish_logged(fields, orig)
+        target["status"] = "logged"
+        claim_state.save_claim(root, target)
+        print_extraction(fields)
+        print(f"claim {target['id']}: logged")
+        pending = [c for c in pending if c["id"] != target["id"]]
+    if last_id:
+        claim_state.save_cursor(root, last_id)
+
+
+def _match_pending(reply: str, pending: list[dict]) -> dict | None:
+    lower = reply.lower()
+    for claim in pending:
+        token = str(claim.get("id") or "")
+        if token and token.lower() in lower:
+            return claim
+    if len(pending) == 1:
+        return pending[0]
+    return None
+
+
 def main() -> None:
     cfg = load_config()
+    process_ntfy_replies(cfg)
     imap: imaplib.IMAP4 | None = None
     try:
         imap = imaplib.IMAP4_SSL(str(cfg["host"]), int(cfg["port"]))
@@ -340,20 +480,24 @@ def main() -> None:
         if typ != "OK":
             print("failed to select INBOX", file=sys.stderr)
             sys.exit(1)
-        found = find_latest_claim(imap)
+        import state as claim_state
+        from extract import extract_claim, journals_from_env, notify_reasons
+        from sheet import confirm_proofs
+
+        skip_ids = claim_state.known_message_ids(Path(str(cfg["state_dir"])))
+        found = find_latest_claim(imap, skip_ids)
         if found is None:
-            print("No CLAIM: message found in INBOX")
+            print("No new CLAIM: message found in INBOX")
             return
         _, msg = found
         report(msg)
-        from extract import extract_claim, journals_from_env
-
+        mid = message_key(msg)
         subject = decode_mime_header(msg.get("Subject"))
         body = text_body(msg)
         for path in save_originals(msg, Path(str(cfg["expenses_root"]))):
             print(f"wrote: {path}")
-            scan, status = save_scan(path)
-            print(f"crop: {status}")
+            scan, crop_status = save_scan(path)
+            print(f"crop: {crop_status}")
             if scan is not None:
                 print(f"wrote: {scan}")
             image = scan if scan is not None else path
@@ -371,15 +515,44 @@ def main() -> None:
             except RuntimeError as exc:
                 print(f"extract failed: {exc}", file=sys.stderr)
                 sys.exit(1)
-            from sheet import confirm_proofs, month_sheet_path, write_claim_row
 
             path, scan, proof_name = confirm_proofs(
                 path, scan, fields.get("claim_date"), fields.get("merchant")
             )
             fields["proof_file"] = proof_name
             print_extraction(fields)
-            sheet = write_claim_row(month_sheet_path(path.parent.parent), fields)
-            print(f"sheet: {sheet}")
+            reasons = notify_reasons(fields, crop_status)
+            if not reasons:
+                finish_logged(fields, path)
+                claim_state.save_claim(
+                    Path(str(cfg["state_dir"])),
+                    {
+                        "id": claim_id_for(mid),
+                        "status": "logged",
+                        "message_id": mid,
+                        "subject": subject,
+                        "fields": fields,
+                        "orig_path": str(path),
+                        "scan_path": str(scan) if scan is not None else "",
+                    },
+                )
+                continue
+            claim = {
+                "id": claim_id_for(mid),
+                "status": "awaiting_reply",
+                "message_id": mid,
+                "subject": subject,
+                "reasons": reasons,
+                "fields": fields,
+                "orig_path": str(path),
+                "scan_path": str(scan) if scan is not None else "",
+                "ntfy_ids": [],
+            }
+            ping_image = scan if scan is not None else path
+            send_review_ping(cfg, claim, ping_image)
+            saved = claim_state.save_claim(Path(str(cfg["state_dir"])), claim)
+            print(f"state: {saved}")
+            print("sheet: (held until ntfy reply)")
     except imaplib.IMAP4.error as exc:
         print(f"IMAP error: {exc}", file=sys.stderr)
         sys.exit(1)

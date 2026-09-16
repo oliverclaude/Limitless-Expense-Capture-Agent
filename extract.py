@@ -88,6 +88,133 @@ def extract_claim(
     return fields
 
 
+CONFIRM_REPLIES = {"ok", "okay", "yes", "y", "proceed", "log", "logged", "confirm", "confirmed"}
+SKIP_REPLIES = {"skip", "skipped", "ignore", "discard"}
+
+
+def interpret_reply(reply: str, fields: dict[str, Any], journals: list[str]) -> dict[str, Any]:
+    """Map an English ntfy reply onto confirm / skip / field updates."""
+    compact = re.sub(r"[.!?]+$", "", reply.strip().lower()).strip()
+    if compact in SKIP_REPLIES:
+        return {"action": "skip", "fields": fields, "credits_used_usd": 0.0}
+    if compact in CONFIRM_REPLIES:
+        updated = dict(fields)
+        refresh_review(updated, journals)
+        updated["needs_review"] = False
+        updated["review_reasons"] = []
+        return {"action": "confirm", "fields": updated, "credits_used_usd": 0.0}
+
+    api_key = os.environ.get("XAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("missing env: XAI_API_KEY")
+    model = os.environ.get("XAI_MODEL", "").strip() or DEFAULT_MODEL
+    snapshot = {
+        "claim_date": fields.get("claim_date"),
+        "personal_amount": fields.get("personal_amount"),
+        "company_amount": fields.get("company_amount"),
+        "vat": fields.get("vat"),
+        "merchant": fields.get("merchant"),
+        "comment": fields.get("comment"),
+        "journal": fields.get("journal"),
+        "review_reasons": fields.get("review_reasons"),
+    }
+    prompt = f"""The operator replied in English about this expense claim. Return JSON only.
+
+Current claim:
+{json.dumps(snapshot, default=str)}
+
+Journals they may use: {", ".join(journals) or "(none)"}
+
+Operator reply:
+{reply}
+
+Decide action:
+- skip: they do not want this logged
+- confirm: log as-is (ok, yes, looks good)
+- update: they changed a field (merchant, half, journal, amounts, date)
+
+JSON:
+{{
+  "action": "skip|confirm|update",
+  "claim_date": "YYYY-MM-DD or null",
+  "personal_amount": number or null,
+  "company_amount": number or null,
+  "vat": number or null,
+  "merchant": "string or null",
+  "comment": "string or null",
+  "journal": "string or null"
+}}
+Keep fields they did not change. "My half" means personal is half of the spend and company is 0.
+"""
+    payload = {"model": model, "input": prompt}
+    data = _post_json(INFERENCE_URL, payload, api_key)
+    text = _output_text(data)
+    try:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        action_obj = json.loads(match.group(0) if match else text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"model did not return JSON: {text[:400]}") from exc
+    if not isinstance(action_obj, dict):
+        action_obj = {}
+    action = str(action_obj.get("action") or "update").lower()
+    if action not in ("skip", "confirm", "update"):
+        action = "update"
+    merged = dict(fields)
+    if action_obj.get("claim_date"):
+        merged["claim_date"] = str(action_obj["claim_date"]).strip()
+    for key in ("personal_amount", "company_amount", "vat"):
+        number = _as_number(action_obj.get(key))
+        if number is not None:
+            merged[key] = number
+    if isinstance(action_obj.get("merchant"), str) and action_obj["merchant"].strip():
+        merged["merchant"] = action_obj["merchant"].strip()
+    if isinstance(action_obj.get("journal"), str) and action_obj["journal"].strip():
+        merged["journal"] = action_obj["journal"].strip()
+    refresh_review(merged, journals)
+    if action == "confirm":
+        merged["needs_review"] = False
+        merged["review_reasons"] = []
+    used = ticks_to_usd((data.get("usage") or {}).get("cost_in_usd_ticks"))
+    merged["credits_used_usd"] = used
+    merged["credits_left_usd"] = remaining_credits(used)
+    return {"action": action, "fields": merged, "credits_used_usd": used}
+
+
+def refresh_review(fields: dict[str, Any], journals: list[str]) -> dict[str, Any]:
+    allowed = {item.lower(): item for item in journals}
+    journal = fields.get("journal")
+    if isinstance(journal, str) and journal.strip():
+        fields["journal"] = allowed.get(journal.strip().lower())
+    else:
+        fields["journal"] = None
+    reasons: list[str] = []
+    if not fields.get("claim_date"):
+        reasons.append("missing claim date")
+    if fields.get("personal_amount") is None:
+        reasons.append("missing amount")
+    if not fields.get("merchant"):
+        reasons.append("missing merchant")
+    if not fields.get("journal"):
+        reasons.append("journal not in list")
+    apply_vat_policy(fields)
+    fields["review_reasons"] = reasons
+    fields["needs_review"] = bool(reasons)
+    return fields
+
+
+def notify_reasons(fields: dict[str, Any], crop_status: str) -> list[str]:
+    reasons: list[str] = []
+    for item in fields.get("review_reasons") or []:
+        text = str(item)
+        if text not in reasons:
+            reasons.append(text)
+    if not fields.get("merchant") and "missing merchant" not in reasons:
+        reasons.append("missing merchant")
+    if crop_status.startswith("failed") and crop_status not in reasons:
+        reasons.append(crop_status)
+    return reasons
+
+
 def remaining_credits(used_usd: float | None) -> float | None:
     remote = _prepaid_balance_usd()
     if remote is not None:
