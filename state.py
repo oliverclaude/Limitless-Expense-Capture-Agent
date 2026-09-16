@@ -90,3 +90,48 @@ def load_cursor(root: Path) -> str | None:
 def save_cursor(root: Path, since: str) -> None:
     path = state_dir(root) / CURSOR_NAME
     path.write_text(json.dumps({"since": since}), encoding="utf-8")
+
+
+def delete_claim(root: Path, claim_id: str) -> None:
+    path = claim_path(root, claim_id)
+    if path.is_file():
+        path.unlink()
+
+
+def prune(
+    root: Path,
+    *,
+    retention_days: int,
+    delete_completed: bool,
+) -> list[str]:
+    """Drop finished claims, and anything older than retention_days."""
+    removed: list[str] = []
+    now = datetime.now(timezone.utc)
+    keep_days = max(retention_days, 0)
+    for claim in iter_claims(root):
+        cid = str(claim.get("id") or "")
+        if not cid:
+            continue
+        status = claim.get("status")
+        if delete_completed and status in ("logged", "skipped") and claim.get("done_sent"):
+            delete_claim(root, cid)
+            removed.append(cid)
+            continue
+        updated = _parse_updated(claim.get("updated"))
+        if updated is not None and (now - updated).days >= keep_days:
+            delete_claim(root, cid)
+            removed.append(cid)
+    return removed
+
+
+def _parse_updated(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed

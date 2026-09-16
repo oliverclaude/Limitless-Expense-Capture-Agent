@@ -40,6 +40,18 @@ CONTENT_TYPE_EXT = {
 }
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"{name} must be an integer", file=sys.stderr)
+        sys.exit(2)
+    return value
+
+
 def load_env_file(path: str) -> None:
     with open(path, encoding="utf-8") as fh:
         for raw in fh:
@@ -97,6 +109,10 @@ def load_config() -> dict[str, str | int | Path]:
         "state_dir": Path(state),
         "ntfy_url": os.environ.get("NTFY_URL", "").strip(),
         "ntfy_topic": os.environ.get("NTFY_TOPIC", "").strip() or DEFAULT_NTFY_TOPIC,
+        "poll_interval_minutes": _env_int("POLL_INTERVAL_MINUTES", 30),
+        "state_retention_days": _env_int("STATE_RETENTION_DAYS", 60),
+        "delete_completed_state": os.environ.get("DELETE_COMPLETED_STATE", "1").strip()
+        not in ("0", "false", "no", "off"),
     }
 
 
@@ -628,7 +644,19 @@ def _match_pending(reply: str, pending: list[dict]) -> dict | None:
     return None
 
 
-def main() -> None:
+def _prune_state(cfg: dict) -> None:
+    import state as claim_state
+
+    removed = claim_state.prune(
+        Path(str(cfg["state_dir"])),
+        retention_days=int(cfg["state_retention_days"]),
+        delete_completed=bool(cfg["delete_completed_state"]),
+    )
+    for cid in removed:
+        print(f"state: removed {cid}")
+
+
+def run_once() -> None:
     cfg = load_config()
     imap: imaplib.IMAP4 | None = None
     try:
@@ -650,6 +678,7 @@ def main() -> None:
         found = find_latest_claim(imap, skip_ids)
         if found is None:
             print("No new CLAIM: message found in INBOX")
+            _prune_state(cfg)
             return
         _, msg = found
         report(msg)
@@ -730,6 +759,7 @@ def main() -> None:
             print(f"state: {saved}")
             print("sheet: (held until ntfy reply)")
             file_mail(imap, mid, FOLDER_REVIEW)
+        _prune_state(cfg)
     except imaplib.IMAP4.error as exc:
         print(f"IMAP error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -742,6 +772,35 @@ def main() -> None:
                 imap.logout()
             except Exception:
                 pass
+
+
+def main() -> None:
+    import argparse
+    import time
+
+    parser = argparse.ArgumentParser(description="Limitless Expense Capture Agent")
+    parser.add_argument(
+        "--loop",
+        action="store_true",
+        help="run forever, sleeping POLL_INTERVAL_MINUTES between passes",
+    )
+    args = parser.parse_args()
+    if not args.loop:
+        run_once()
+        return
+    while True:
+        try:
+            run_once()
+        except SystemExit as exc:
+            if exc.code == 2:
+                raise
+            print(f"run ended: {exc.code}", file=sys.stderr)
+        except Exception as exc:
+            print(f"run error: {exc}", file=sys.stderr)
+        cfg = load_config()
+        minutes = max(1, int(cfg["poll_interval_minutes"]))
+        print(f"sleep: {minutes} minutes")
+        time.sleep(minutes * 60)
 
 
 if __name__ == "__main__":

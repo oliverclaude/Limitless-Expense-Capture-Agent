@@ -7,29 +7,38 @@ import ssl
 from email.message import EmailMessage
 from typing import Any
 
+from sheet import HEADERS
+
+_FIELD_KEYS = {
+    "claim date": "claim_date",
+    "personal": "personal_amount",
+    "company": "company_amount",
+    "vat": "vat",
+    "comment": "comment",
+    "journal": "journal",
+    "proof file": "proof_file",
+}
+
+
+def reply_subject(subject: str) -> str:
+    text = subject.strip() or "CLAIM:"
+    if text.lower().startswith("re:"):
+        return text
+    return f"Re: {text}"
+
 
 def done_body(fields: dict[str, Any], *, skipped: bool) -> str:
     heading = "Skipped." if skipped else "Done."
-    bits: list[str] = []
-    amount = fields.get("personal_amount")
-    company = fields.get("company_amount")
-    currency = str(fields.get("currency") or "ZAR").upper()
-    if amount is not None:
-        bits.append(_money(amount, currency))
-    if company not in (None, 0, 0.0):
-        bits.append(f"company {_money(company, currency)}")
-    merchant = fields.get("merchant")
-    if merchant:
-        bits.append(str(merchant))
-    comment = fields.get("comment")
-    if comment:
-        bits.append(str(comment))
-    proof = fields.get("proof_file")
-    if proof:
-        bits.append(str(proof))
-    if not bits:
-        return heading + "\n"
-    return heading + "\n\n" + " · ".join(bits) + "\n"
+    lines = [heading, ""]
+    for header in HEADERS:
+        key = _FIELD_KEYS.get(header, header)
+        value = fields.get(key)
+        if value is None or value == "":
+            shown = "(none)"
+        else:
+            shown = str(value)
+        lines.append(f"{header}: {shown}")
+    return "\n".join(lines) + "\n"
 
 
 def send_done_mail(
@@ -49,7 +58,7 @@ def send_done_mail(
     msg = EmailMessage()
     msg["From"] = user
     msg["To"] = work_email.strip()
-    msg["Subject"] = subject
+    msg["Subject"] = reply_subject(subject)
     if in_reply_to.strip():
         msg["In-Reply-To"] = in_reply_to.strip()
         msg["References"] = in_reply_to.strip()
@@ -58,10 +67,3 @@ def send_done_mail(
     with smtplib.SMTP_SSL(host, port, timeout=30, context=context) as smtp:
         smtp.login(user, password)
         smtp.send_message(msg)
-
-
-def _money(amount: float, currency: str) -> str:
-    value = f"{amount:.2f}".rstrip("0").rstrip(".")
-    if currency == "ZAR":
-        return f"R{value}"
-    return f"{value} {currency}"
