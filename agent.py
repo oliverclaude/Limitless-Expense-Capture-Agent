@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Slice 7: ntfy on uncertainty; continue from English replies on the next run.
+"""Slice 8: file mail into processed / needs_review / failed.
 
-Leaves the message unread. Does not send Done/Skipped email.
+Does not send Done/Skipped email.
 """
 
 from __future__ import annotations
@@ -24,6 +24,10 @@ REQUIRED_ENV = ("IMAP_HOST", "IMAP_USER", "IMAP_PASSWORD")
 DEFAULT_EXPENSES_ROOT = "/g-drive"
 DEFAULT_STATE_DIR = "/g-drive/agent-state"
 DEFAULT_NTFY_TOPIC = "Limitless-Expense-Capture-Agent"
+FOLDER_PROCESSED = "processed"
+FOLDER_REVIEW = "needs_review"
+FOLDER_FAILED = "failed"
+MAIL_FOLDERS = (FOLDER_PROCESSED, FOLDER_REVIEW, FOLDER_FAILED)
 PHOTO_SUFFIXES = (".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".gif", ".tif", ".tiff")
 PDF_SUFFIXES = (".pdf",)
 CONTENT_TYPE_EXT = {
@@ -99,7 +103,7 @@ def is_claim_subject(subject: str) -> bool:
 
 
 def fetch_part(imap: imaplib.IMAP4, seq: bytes, spec: str) -> bytes | None:
-    typ, data = imap.fetch(seq, spec)
+    typ, data = imap.uid("FETCH", seq, spec)
     if typ != "OK" or not data:
         return None
     for item in data:
@@ -227,9 +231,97 @@ def claim_id_for(message_id: str) -> str:
     return hashlib.sha256(message_id.encode("utf-8")).hexdigest()[:8]
 
 
+def ensure_mail_folders(imap: imaplib.IMAP4) -> None:
+    for name in MAIL_FOLDERS:
+        typ, data = imap.create(name)
+        if typ == "OK":
+            continue
+        detail = b" ".join(item for item in (data or []) if isinstance(item, bytes)).decode(
+            "utf-8", errors="replace"
+        ).lower()
+        if "exists" not in detail and "already" not in detail:
+            print(f"folder {name}: {typ} {detail}", file=sys.stderr)
+
+
+def _imap_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _uid_search(imap: imaplib.IMAP4, *criteria: str) -> list[bytes]:
+    typ, data = imap.uid("SEARCH", None, *criteria)
+    if typ != "OK" or not data or not data[0]:
+        return []
+    return data[0].split()
+
+
+def find_uid_by_message_id(imap: imaplib.IMAP4, mailbox: str, message_id: str) -> bytes | None:
+    typ, _ = imap.select(mailbox)
+    if typ != "OK":
+        return None
+    for candidate in (message_id, message_id.strip("<>")):
+        uids = _uid_search(imap, "HEADER", "Message-ID", _imap_quote(candidate))
+        if uids:
+            return uids[-1]
+    uids = _uid_search(imap, "ALL")
+    for uid in reversed(uids):
+        raw = fetch_part(imap, uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT DATE)])")
+        if not raw:
+            continue
+        if message_key(parse_headers(raw)) == message_id:
+            return uid
+    return None
+
+
+def imap_move(imap: imaplib.IMAP4, uid: bytes, dest: str) -> None:
+    typ, _ = imap.uid("MOVE", uid, dest)
+    if typ == "OK":
+        return
+    typ, _ = imap.uid("COPY", uid, dest)
+    if typ != "OK":
+        raise imaplib.IMAP4.error(f"copy to {dest} failed")
+    imap.uid("STORE", uid, "+FLAGS", r"(\Deleted)")
+    imap.expunge()
+
+
+def file_mail(imap: imaplib.IMAP4, message_id: str, dest: str) -> None:
+    sources = ("INBOX", FOLDER_REVIEW, FOLDER_FAILED, FOLDER_PROCESSED)
+    for box in sources:
+        uid = find_uid_by_message_id(imap, box, message_id)
+        if uid is None:
+            continue
+        if box == dest:
+            print(f"mail: already in {dest}")
+            return
+        imap.select(box)
+        imap_move(imap, uid, dest)
+        print(f"mail: {box} -> {dest}")
+        return
+    print(f"mail: not found for {dest}", file=sys.stderr)
+
+
+def file_known_claims(imap: imaplib.IMAP4, root: Path) -> None:
+    import state as claim_state
+
+    for claim in claim_state.iter_claims(root):
+        mid = claim.get("message_id")
+        status = claim.get("status")
+        if not isinstance(mid, str) or not mid.strip():
+            continue
+        if status in ("logged", "skipped"):
+            dest = FOLDER_PROCESSED
+        elif status == "awaiting_reply":
+            dest = FOLDER_REVIEW
+        else:
+            continue
+        try:
+            file_mail(imap, mid.strip(), dest)
+        except imaplib.IMAP4.error as exc:
+            print(f"mail file failed: {exc}", file=sys.stderr)
+
+
 def find_latest_claim(imap: imaplib.IMAP4, skip_ids: set[str] | None = None) -> tuple[bytes, Message] | None:
     skip_ids = skip_ids or set()
-    typ, data = imap.search(None, "ALL")
+    typ, data = imap.uid("SEARCH", None, "ALL")
     if typ != "OK" or not data or not data[0]:
         return None
     seqs = data[0].split()
@@ -394,7 +486,7 @@ def send_review_ping(cfg: dict, claim: dict, image: Path | None) -> None:
     print(f"ntfy: sent claim {claim_id}")
 
 
-def process_ntfy_replies(cfg: dict) -> None:
+def process_ntfy_replies(cfg: dict, imap: imaplib.IMAP4 | None = None) -> None:
     from extract import interpret_reply, journals_from_env
     from ntfy import is_our_message, poll
     import state as claim_state
@@ -435,10 +527,13 @@ def process_ntfy_replies(cfg: dict) -> None:
         action = result["action"]
         fields = result["fields"]
         target["fields"] = fields
+        mid = str(target.get("message_id") or "")
         if action == "skip":
             target["status"] = "skipped"
             claim_state.save_claim(root, target)
             print(f"claim {target['id']}: skipped")
+            if imap is not None and mid:
+                file_mail(imap, mid, FOLDER_PROCESSED)
             pending = [c for c in pending if c["id"] != target["id"]]
             continue
         orig = Path(str(target.get("orig_path") or ""))
@@ -446,6 +541,8 @@ def process_ntfy_replies(cfg: dict) -> None:
             claim_state.save_claim(root, target)
             print(f"claim {target['id']}: still needs review")
             print_extraction(fields)
+            if imap is not None and mid:
+                file_mail(imap, mid, FOLDER_REVIEW)
             continue
         if orig.is_file():
             finish_logged(fields, orig)
@@ -453,6 +550,8 @@ def process_ntfy_replies(cfg: dict) -> None:
         claim_state.save_claim(root, target)
         print_extraction(fields)
         print(f"claim {target['id']}: logged")
+        if imap is not None and mid:
+            file_mail(imap, mid, FOLDER_PROCESSED)
         pending = [c for c in pending if c["id"] != target["id"]]
     if last_id:
         claim_state.save_cursor(root, last_id)
@@ -471,20 +570,23 @@ def _match_pending(reply: str, pending: list[dict]) -> dict | None:
 
 def main() -> None:
     cfg = load_config()
-    process_ntfy_replies(cfg)
     imap: imaplib.IMAP4 | None = None
     try:
         imap = imaplib.IMAP4_SSL(str(cfg["host"]), int(cfg["port"]))
         imap.login(str(cfg["user"]), str(cfg["password"]))
-        typ, _ = imap.select("INBOX", readonly=True)
-        if typ != "OK":
-            print("failed to select INBOX", file=sys.stderr)
-            sys.exit(1)
+        ensure_mail_folders(imap)
         import state as claim_state
         from extract import extract_claim, journals_from_env, notify_reasons
         from sheet import confirm_proofs
 
-        skip_ids = claim_state.known_message_ids(Path(str(cfg["state_dir"])))
+        state_root = Path(str(cfg["state_dir"]))
+        file_known_claims(imap, state_root)
+        process_ntfy_replies(cfg, imap)
+        typ, _ = imap.select("INBOX")
+        if typ != "OK":
+            print("failed to select INBOX", file=sys.stderr)
+            sys.exit(1)
+        skip_ids = claim_state.known_message_ids(state_root)
         found = find_latest_claim(imap, skip_ids)
         if found is None:
             print("No new CLAIM: message found in INBOX")
@@ -494,7 +596,12 @@ def main() -> None:
         mid = message_key(msg)
         subject = decode_mime_header(msg.get("Subject"))
         body = text_body(msg)
-        for path in save_originals(msg, Path(str(cfg["expenses_root"]))):
+        try:
+            orig_paths = save_originals(msg, Path(str(cfg["expenses_root"])))
+        except SystemExit:
+            file_mail(imap, mid, FOLDER_FAILED)
+            raise
+        for path in orig_paths:
             print(f"wrote: {path}")
             scan, crop_status = save_scan(path)
             print(f"crop: {crop_status}")
@@ -514,6 +621,7 @@ def main() -> None:
                 )
             except RuntimeError as exc:
                 print(f"extract failed: {exc}", file=sys.stderr)
+                file_mail(imap, mid, FOLDER_FAILED)
                 sys.exit(1)
 
             path, scan, proof_name = confirm_proofs(
@@ -536,6 +644,7 @@ def main() -> None:
                         "scan_path": str(scan) if scan is not None else "",
                     },
                 )
+                file_mail(imap, mid, FOLDER_PROCESSED)
                 continue
             claim = {
                 "id": claim_id_for(mid),
@@ -553,6 +662,7 @@ def main() -> None:
             saved = claim_state.save_claim(Path(str(cfg["state_dir"])), claim)
             print(f"state: {saved}")
             print("sheet: (held until ntfy reply)")
+            file_mail(imap, mid, FOLDER_REVIEW)
     except imaplib.IMAP4.error as exc:
         print(f"IMAP error: {exc}", file=sys.stderr)
         sys.exit(1)
