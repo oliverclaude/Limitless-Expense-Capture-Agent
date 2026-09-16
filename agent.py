@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Slice 8: file mail into processed / needs_review / failed.
-
-Does not send Done/Skipped email.
-"""
+"""Slice 9: Done/Skipped email to the configured work address only."""
 
 from __future__ import annotations
 
@@ -80,11 +77,22 @@ def load_config() -> dict[str, str | int | Path]:
 
     root = os.environ.get("EXPENSES_ROOT", "").strip() or DEFAULT_EXPENSES_ROOT
     state = os.environ.get("AGENT_STATE_DIR", "").strip() or DEFAULT_STATE_DIR
+    smtp_port_raw = os.environ.get("SMTP_PORT", "").strip() or "465"
+    try:
+        smtp_port = int(smtp_port_raw)
+    except ValueError:
+        print("SMTP_PORT must be an integer", file=sys.stderr)
+        sys.exit(2)
+    imap_host = os.environ["IMAP_HOST"].strip()
+    imap_user = os.environ["IMAP_USER"].strip()
     return {
-        "host": os.environ["IMAP_HOST"].strip(),
+        "host": imap_host,
         "port": port,
-        "user": os.environ["IMAP_USER"].strip(),
+        "user": imap_user,
         "password": os.environ["IMAP_PASSWORD"],
+        "smtp_host": os.environ.get("SMTP_HOST", "").strip() or imap_host,
+        "smtp_port": smtp_port,
+        "work_email": os.environ.get("WORK_EMAIL", "").strip(),
         "expenses_root": Path(root),
         "state_dir": Path(state),
         "ntfy_url": os.environ.get("NTFY_URL", "").strip(),
@@ -299,7 +307,7 @@ def file_mail(imap: imaplib.IMAP4, message_id: str, dest: str) -> None:
     print(f"mail: not found for {dest}", file=sys.stderr)
 
 
-def file_known_claims(imap: imaplib.IMAP4, root: Path) -> None:
+def file_known_claims(imap: imaplib.IMAP4, root: Path, cfg: dict) -> None:
     import state as claim_state
 
     for claim in claim_state.iter_claims(root):
@@ -309,6 +317,19 @@ def file_known_claims(imap: imaplib.IMAP4, root: Path) -> None:
             continue
         if status in ("logged", "skipped"):
             dest = FOLDER_PROCESSED
+            if not claim.get("done_sent"):
+                try:
+                    send_close_mail(
+                        cfg,
+                        dict(claim.get("fields") or {}),
+                        subject=str(claim.get("subject") or "CLAIM:"),
+                        message_id=mid.strip(),
+                        skipped=(status == "skipped"),
+                    )
+                    claim["done_sent"] = True
+                    claim_state.save_claim(root, claim)
+                except Exception as exc:
+                    print(f"done mail failed: {exc}", file=sys.stderr)
         elif status == "awaiting_reply":
             dest = FOLDER_REVIEW
         else:
@@ -453,6 +474,23 @@ def finish_logged(fields: dict, orig: Path) -> None:
     print(f"sheet: {sheet}")
 
 
+def send_close_mail(cfg: dict, fields: dict, *, subject: str, message_id: str, skipped: bool) -> None:
+    from done_mail import send_done_mail
+
+    send_done_mail(
+        host=str(cfg["smtp_host"]),
+        port=int(cfg["smtp_port"]),
+        user=str(cfg["user"]),
+        password=str(cfg["password"]),
+        work_email=str(cfg["work_email"]),
+        subject=subject,
+        fields=fields,
+        skipped=skipped,
+        in_reply_to=message_id,
+    )
+    print("mail: Done" if not skipped else "mail: Skipped")
+
+
 def send_review_ping(cfg: dict, claim: dict, image: Path | None) -> None:
     from ntfy import LECA_PREFIX, publish
 
@@ -530,6 +568,17 @@ def process_ntfy_replies(cfg: dict, imap: imaplib.IMAP4 | None = None) -> None:
         mid = str(target.get("message_id") or "")
         if action == "skip":
             target["status"] = "skipped"
+            try:
+                send_close_mail(
+                    cfg,
+                    fields,
+                    subject=str(target.get("subject") or "CLAIM:"),
+                    message_id=mid,
+                    skipped=True,
+                )
+                target["done_sent"] = True
+            except Exception as exc:
+                print(f"done mail failed: {exc}", file=sys.stderr)
             claim_state.save_claim(root, target)
             print(f"claim {target['id']}: skipped")
             if imap is not None and mid:
@@ -546,6 +595,17 @@ def process_ntfy_replies(cfg: dict, imap: imaplib.IMAP4 | None = None) -> None:
             continue
         if orig.is_file():
             finish_logged(fields, orig)
+        try:
+            send_close_mail(
+                cfg,
+                fields,
+                subject=str(target.get("subject") or "CLAIM:"),
+                message_id=mid,
+                skipped=False,
+            )
+            target["done_sent"] = True
+        except Exception as exc:
+            print(f"done mail failed: {exc}", file=sys.stderr)
         target["status"] = "logged"
         claim_state.save_claim(root, target)
         print_extraction(fields)
@@ -580,7 +640,7 @@ def main() -> None:
         from sheet import confirm_proofs
 
         state_root = Path(str(cfg["state_dir"]))
-        file_known_claims(imap, state_root)
+        file_known_claims(imap, state_root, cfg)
         process_ntfy_replies(cfg, imap)
         typ, _ = imap.select("INBOX")
         if typ != "OK":
@@ -632,6 +692,12 @@ def main() -> None:
             reasons = notify_reasons(fields, crop_status)
             if not reasons:
                 finish_logged(fields, path)
+                done_sent = False
+                try:
+                    send_close_mail(cfg, fields, subject=subject, message_id=mid, skipped=False)
+                    done_sent = True
+                except Exception as exc:
+                    print(f"done mail failed: {exc}", file=sys.stderr)
                 claim_state.save_claim(
                     Path(str(cfg["state_dir"])),
                     {
@@ -642,6 +708,7 @@ def main() -> None:
                         "fields": fields,
                         "orig_path": str(path),
                         "scan_path": str(scan) if scan is not None else "",
+                        "done_sent": done_sent,
                     },
                 )
                 file_mail(imap, mid, FOLDER_PROCESSED)
