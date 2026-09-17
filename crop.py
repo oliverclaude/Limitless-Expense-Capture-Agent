@@ -25,11 +25,13 @@ def straighten_slip_hybrid(path: Path) -> tuple[bytes | None, str]:
     if not _needs_xai_corners(path, opencv_jpeg):
         return opencv_jpeg, opencv_status
     try:
-        from extract import slip_corners
+        from extract import CreditExhaustedError, slip_corners
     except ImportError:
         return opencv_jpeg, opencv_status
     try:
         corners = slip_corners(path)
+    except CreditExhaustedError:
+        raise
     except RuntimeError:
         corners = None
     if not corners:

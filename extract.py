@@ -16,6 +16,21 @@ TICKS_PER_USD = 10_000_000_000
 DEFAULT_MODEL = "grok-4.6"
 INFERENCE_URL = "https://api.x.ai/v1/responses"
 MANAGEMENT_BASE = "https://management-api.x.ai"
+_CREDIT_HINTS = (
+    "credit",
+    "credits",
+    "billing",
+    "insufficient",
+    "depleted",
+    "spend limit",
+    "payment required",
+    "prepaid",
+    "out of fund",
+)
+
+
+class CreditExhaustedError(RuntimeError):
+    """xAI rejected the call because prepaid credit is gone or too low."""
 
 
 def _csv_env(name: str, default: str = "") -> list[str]:
@@ -397,7 +412,10 @@ def _post_json(url: str, payload: dict[str, Any], api_key: str) -> dict[str, Any
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:800]
-        raise RuntimeError(f"xAI HTTP {exc.code}: {detail}") from exc
+        message = f"xAI HTTP {exc.code}: {detail}"
+        if _is_credit_error(exc.code, detail):
+            raise CreditExhaustedError(message) from exc
+        raise RuntimeError(message) from exc
 
 
 def _get_json(url: str, api_key: str) -> dict[str, Any]:
@@ -411,7 +429,19 @@ def _get_json(url: str, api_key: str) -> dict[str, Any]:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:400]
-        raise RuntimeError(f"xAI HTTP {exc.code}: {detail}") from exc
+        message = f"xAI HTTP {exc.code}: {detail}"
+        if _is_credit_error(exc.code, detail):
+            raise CreditExhaustedError(message) from exc
+        raise RuntimeError(message) from exc
+
+
+def _is_credit_error(status: int, detail: str) -> bool:
+    if status == 402:
+        return True
+    if status == 429:
+        return False
+    text = detail.lower()
+    return any(hint in text for hint in _CREDIT_HINTS)
 
 
 def _output_text(data: dict[str, Any]) -> str:

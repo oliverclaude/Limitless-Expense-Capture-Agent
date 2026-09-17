@@ -40,6 +40,17 @@ CONTENT_TYPE_EXT = {
 }
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"{name} must be a number", file=sys.stderr)
+        sys.exit(2)
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -113,6 +124,8 @@ def load_config() -> dict[str, str | int | Path]:
         "state_retention_days": _env_int("STATE_RETENTION_DAYS", 60),
         "delete_completed_state": os.environ.get("DELETE_COMPLETED_STATE", "1").strip()
         not in ("0", "false", "no", "off"),
+        "xai_credit_alert_usd": _env_float("XAI_CREDIT_ALERT_USD", 0.05),
+        "xai_credit_alert_hours": _env_int("XAI_CREDIT_ALERT_COOLDOWN_HOURS", 6),
     }
 
 
@@ -507,6 +520,59 @@ def send_close_mail(cfg: dict, fields: dict, *, subject: str, message_id: str, s
     print("mail: Done" if not skipped else "mail: Skipped")
 
 
+def notify_xai_credits(cfg: dict, *, remaining: float | None, detail: str) -> None:
+    """Ping the main ntfy topic when prepaid xAI credit is gone or below the alert floor."""
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    from ntfy import publish
+
+    url = str(cfg["ntfy_url"])
+    if not url:
+        print("xAI credit alert skipped: NTFY_URL empty", file=sys.stderr)
+        return
+    stamp_path = Path(str(cfg["state_dir"])) / "xai-credit-alert.json"
+    cooldown = timedelta(hours=max(1, int(cfg["xai_credit_alert_hours"])))
+    now = datetime.now(timezone.utc)
+    if stamp_path.is_file():
+        try:
+            last = json.loads(stamp_path.read_text(encoding="utf-8")).get("sent")
+            sent_at = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+            if sent_at.tzinfo is None:
+                sent_at = sent_at.replace(tzinfo=timezone.utc)
+            if now - sent_at < cooldown:
+                print("xAI credit alert: still in cooldown")
+                return
+        except (OSError, ValueError, json.JSONDecodeError, TypeError):
+            pass
+    left = "unknown" if remaining is None else f"${remaining:.4f}"
+    message = (
+        "xAI prepaid credits are exhausted or too low to process claims. "
+        f"Remaining about {left}. Top up at https://console.x.ai then the next loop will retry. "
+        f"{detail[:200]}"
+    )
+    try:
+        publish(
+            url,
+            str(cfg["ntfy_topic"]),
+            title="xAI credits low",
+            message=message,
+        )
+        stamp_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp_path.write_text(json.dumps({"sent": now.isoformat()}), encoding="utf-8")
+        print("ntfy: xAI credits low")
+    except Exception as exc:
+        print(f"xAI credit alert failed: {exc}", file=sys.stderr)
+
+
+def maybe_alert_low_credits(cfg: dict, remaining: float | None) -> None:
+    if remaining is None:
+        return
+    if remaining > float(cfg["xai_credit_alert_usd"]):
+        return
+    notify_xai_credits(cfg, remaining=remaining, detail="balance at or below alert floor")
+
+
 def send_review_ping(cfg: dict, claim: dict, image: Path | None) -> None:
     from ntfy import LECA_PREFIX, publish
 
@@ -541,7 +607,7 @@ def send_review_ping(cfg: dict, claim: dict, image: Path | None) -> None:
 
 
 def process_ntfy_replies(cfg: dict, imap: imaplib.IMAP4 | None = None) -> None:
-    from extract import interpret_reply, journals_from_env
+    from extract import CreditExhaustedError, interpret_reply, journals_from_env
     from ntfy import is_our_message, poll
     import state as claim_state
 
@@ -575,6 +641,10 @@ def process_ntfy_replies(cfg: dict, imap: imaplib.IMAP4 | None = None) -> None:
         print(f"ntfy reply for {target['id']}: {text}")
         try:
             result = interpret_reply(text, dict(target.get("fields") or {}), journals)
+        except CreditExhaustedError as exc:
+            print(f"ntfy reply parse failed (credits): {exc}", file=sys.stderr)
+            notify_xai_credits(cfg, remaining=0.0, detail=str(exc))
+            continue
         except RuntimeError as exc:
             print(f"ntfy reply parse failed: {exc}", file=sys.stderr)
             continue
@@ -765,7 +835,7 @@ def run_once() -> None:
         imap.login(str(cfg["user"]), str(cfg["password"]))
         ensure_mail_folders(imap)
         import state as claim_state
-        from extract import extract_claim, journals_from_env, notify_reasons
+        from extract import CreditExhaustedError, extract_claim, journals_from_env, notify_reasons
         from sheet import confirm_proofs
 
         state_root = Path(str(cfg["state_dir"]))
@@ -793,7 +863,13 @@ def run_once() -> None:
             raise
         for path in orig_paths:
             print(f"wrote: {path}")
-            scan, crop_status = save_scan(path)
+            try:
+                scan, crop_status = save_scan(path)
+            except CreditExhaustedError as exc:
+                print(f"crop xAI credits: {exc}", file=sys.stderr)
+                notify_xai_credits(cfg, remaining=0.0, detail=str(exc))
+                file_mail(imap, mid, FOLDER_FAILED)
+                sys.exit(1)
             print(f"crop: {crop_status}")
             if scan is not None:
                 print(f"wrote: {scan}")
@@ -809,6 +885,11 @@ def run_once() -> None:
                     proof_name=(scan or path).name,
                     journals=journals_from_env(),
                 )
+            except CreditExhaustedError as exc:
+                print(f"extract failed (credits): {exc}", file=sys.stderr)
+                notify_xai_credits(cfg, remaining=0.0, detail=str(exc))
+                file_mail(imap, mid, FOLDER_FAILED)
+                sys.exit(1)
             except RuntimeError as exc:
                 print(f"extract failed: {exc}", file=sys.stderr)
                 file_mail(imap, mid, FOLDER_FAILED)
@@ -819,6 +900,7 @@ def run_once() -> None:
             )
             fields["proof_file"] = proof_name
             print_extraction(fields)
+            maybe_alert_low_credits(cfg, fields.get("credits_left_usd"))
             reasons = notify_reasons(fields, crop_status)
             if not reasons:
                 finish_logged(fields, path)
