@@ -613,13 +613,20 @@ def _local_remaining(used_usd: float | None) -> float | None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"remaining_usd": remaining}), encoding="utf-8")
-    except OSError:
-        pass
+        print(f"prepaid ledger: {path} remaining ${remaining:.4f}")
+    except OSError as exc:
+        print(f"prepaid ledger write failed ({path}): {exc}", file=sys.stderr)
     return remaining
 
 
 def _ledger_path() -> Path:
+    explicit = os.environ.get("XAI_PREPAID_LEDGER", "").strip()
+    if explicit:
+        return Path(explicit)
+    state = os.environ.get("AGENT_STATE_DIR", "").strip()
+    if state:
+        return Path(state) / "prepaid.json"
     env_file = os.environ.get("ENV_FILE", "").strip()
     if env_file:
         return Path(env_file).resolve().parent / "prepaid.json"
-    return Path(".prepaid.json")
+    return Path("/g-drive/agent-state/prepaid.json")

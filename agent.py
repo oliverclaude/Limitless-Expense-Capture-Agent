@@ -826,6 +826,114 @@ def announce_command_topic(cfg: dict) -> None:
     print(f"command topic: {topic}")
 
 
+def process_inbox_claim(
+    cfg: dict, imap: imaplib.IMAP4, msg: Message, state_root: Path
+) -> None:
+    import state as claim_state
+    from extract import CreditExhaustedError, extract_claim, journals_from_env, notify_reasons
+    from sheet import confirm_proofs
+
+    report(msg)
+    mid = message_key(msg)
+    subject = decode_mime_header(msg.get("Subject"))
+    body = text_body(msg)
+    try:
+        orig_paths = save_originals(msg, Path(str(cfg["expenses_root"])))
+    except SystemExit:
+        file_mail(imap, mid, FOLDER_FAILED)
+        return
+    for path in orig_paths:
+        print(f"wrote: {path}")
+        pdf_text = ""
+        try:
+            if path.suffix.lower() in PDF_SUFFIXES:
+                from pdf_proof import prepare_pdf
+
+                pdf_text, scan, crop_status = prepare_pdf(path)
+            else:
+                scan, crop_status = save_scan(path)
+        except CreditExhaustedError as exc:
+            print(f"crop xAI credits: {exc}", file=sys.stderr)
+            notify_xai_credits(cfg, remaining=0.0, detail=str(exc))
+            file_mail(imap, mid, FOLDER_FAILED)
+            raise
+        print(f"crop: {crop_status}")
+        if scan is not None:
+            print(f"wrote: {scan}")
+        if scan is not None:
+            image: Path | None = scan
+        elif path.suffix.lower() in PDF_SUFFIXES:
+            image = None
+        else:
+            image = path
+        try:
+            fields = extract_claim(
+                subject=subject,
+                body=body,
+                image_path=image,
+                proof_name=(scan or path).name,
+                journals=journals_from_env(),
+                pdf_text=pdf_text,
+            )
+        except CreditExhaustedError as exc:
+            print(f"extract failed (credits): {exc}", file=sys.stderr)
+            notify_xai_credits(cfg, remaining=0.0, detail=str(exc))
+            file_mail(imap, mid, FOLDER_FAILED)
+            raise
+        except RuntimeError as exc:
+            print(f"extract failed: {exc}", file=sys.stderr)
+            file_mail(imap, mid, FOLDER_FAILED)
+            return
+
+        path, scan, proof_name = confirm_proofs(
+            path, scan, fields.get("claim_date"), fields.get("merchant")
+        )
+        fields["proof_file"] = proof_name
+        print_extraction(fields)
+        maybe_alert_low_credits(cfg, fields.get("credits_left_usd"))
+        reasons = notify_reasons(fields, crop_status)
+        if not reasons:
+            finish_logged(fields, path)
+            done_sent = False
+            try:
+                send_close_mail(cfg, fields, subject=subject, message_id=mid, skipped=False)
+                done_sent = True
+            except Exception as exc:
+                print(f"done mail failed: {exc}", file=sys.stderr)
+            claim_state.save_claim(
+                state_root,
+                {
+                    "id": claim_id_for(mid),
+                    "status": "logged",
+                    "message_id": mid,
+                    "subject": subject,
+                    "fields": fields,
+                    "orig_path": str(path),
+                    "scan_path": str(scan) if scan is not None else "",
+                    "done_sent": done_sent,
+                },
+            )
+            file_mail(imap, mid, FOLDER_PROCESSED)
+            continue
+        claim = {
+            "id": claim_id_for(mid),
+            "status": "awaiting_reply",
+            "message_id": mid,
+            "subject": subject,
+            "reasons": reasons,
+            "fields": fields,
+            "orig_path": str(path),
+            "scan_path": str(scan) if scan is not None else "",
+            "ntfy_ids": [],
+        }
+        ping_image = scan if scan is not None else path
+        send_review_ping(cfg, claim, ping_image)
+        saved = claim_state.save_claim(state_root, claim)
+        print(f"state: {saved}")
+        print("sheet: (held until ntfy reply)")
+        file_mail(imap, mid, FOLDER_REVIEW)
+
+
 def run_once() -> None:
     cfg = load_config()
     print("pass: checking mail")
@@ -845,112 +953,26 @@ def run_once() -> None:
         if typ != "OK":
             print("failed to select INBOX", file=sys.stderr)
             sys.exit(1)
-        skip_ids = claim_state.known_message_ids(state_root)
-        found = find_latest_claim(imap, skip_ids)
-        if found is None:
-            print("No new CLAIM: message found in INBOX")
-            _prune_state(cfg)
-            return
-        _, msg = found
-        report(msg)
-        mid = message_key(msg)
-        subject = decode_mime_header(msg.get("Subject"))
-        body = text_body(msg)
-        try:
-            orig_paths = save_originals(msg, Path(str(cfg["expenses_root"])))
-        except SystemExit:
-            file_mail(imap, mid, FOLDER_FAILED)
-            raise
-        for path in orig_paths:
-            print(f"wrote: {path}")
-            pdf_text = ""
-            try:
-                if path.suffix.lower() in PDF_SUFFIXES:
-                    from pdf_proof import prepare_pdf
-
-                    pdf_text, scan, crop_status = prepare_pdf(path)
+        done = 0
+        while True:
+            typ, _ = imap.select("INBOX")
+            if typ != "OK":
+                print("failed to select INBOX", file=sys.stderr)
+                sys.exit(1)
+            skip_ids = claim_state.known_message_ids(state_root)
+            found = find_latest_claim(imap, skip_ids)
+            if found is None:
+                if done == 0:
+                    print("No new CLAIM: message found in INBOX")
                 else:
-                    scan, crop_status = save_scan(path)
-            except CreditExhaustedError as exc:
-                print(f"crop xAI credits: {exc}", file=sys.stderr)
-                notify_xai_credits(cfg, remaining=0.0, detail=str(exc))
-                file_mail(imap, mid, FOLDER_FAILED)
-                sys.exit(1)
-            print(f"crop: {crop_status}")
-            if scan is not None:
-                print(f"wrote: {scan}")
-            if scan is not None:
-                image: Path | None = scan
-            elif path.suffix.lower() in PDF_SUFFIXES:
-                image = None
-            else:
-                image = path
+                    print(f"pass: finished {done} claim(s)")
+                break
+            _, msg = found
             try:
-                fields = extract_claim(
-                    subject=subject,
-                    body=body,
-                    image_path=image,
-                    proof_name=(scan or path).name,
-                    journals=journals_from_env(),
-                    pdf_text=pdf_text,
-                )
-            except CreditExhaustedError as exc:
-                print(f"extract failed (credits): {exc}", file=sys.stderr)
-                notify_xai_credits(cfg, remaining=0.0, detail=str(exc))
-                file_mail(imap, mid, FOLDER_FAILED)
-                sys.exit(1)
-            except RuntimeError as exc:
-                print(f"extract failed: {exc}", file=sys.stderr)
-                file_mail(imap, mid, FOLDER_FAILED)
-                sys.exit(1)
-
-            path, scan, proof_name = confirm_proofs(
-                path, scan, fields.get("claim_date"), fields.get("merchant")
-            )
-            fields["proof_file"] = proof_name
-            print_extraction(fields)
-            maybe_alert_low_credits(cfg, fields.get("credits_left_usd"))
-            reasons = notify_reasons(fields, crop_status)
-            if not reasons:
-                finish_logged(fields, path)
-                done_sent = False
-                try:
-                    send_close_mail(cfg, fields, subject=subject, message_id=mid, skipped=False)
-                    done_sent = True
-                except Exception as exc:
-                    print(f"done mail failed: {exc}", file=sys.stderr)
-                claim_state.save_claim(
-                    Path(str(cfg["state_dir"])),
-                    {
-                        "id": claim_id_for(mid),
-                        "status": "logged",
-                        "message_id": mid,
-                        "subject": subject,
-                        "fields": fields,
-                        "orig_path": str(path),
-                        "scan_path": str(scan) if scan is not None else "",
-                        "done_sent": done_sent,
-                    },
-                )
-                file_mail(imap, mid, FOLDER_PROCESSED)
-                continue
-            claim = {
-                "id": claim_id_for(mid),
-                "status": "awaiting_reply",
-                "message_id": mid,
-                "subject": subject,
-                "reasons": reasons,
-                "fields": fields,
-                "orig_path": str(path),
-                "scan_path": str(scan) if scan is not None else "",
-                "ntfy_ids": [],
-            }
-            ping_image = scan if scan is not None else path
-            send_review_ping(cfg, claim, ping_image)
-            saved = claim_state.save_claim(Path(str(cfg["state_dir"])), claim)
-            print(f"state: {saved}")
-            print("sheet: (held until ntfy reply)")
-            file_mail(imap, mid, FOLDER_REVIEW)
+                process_inbox_claim(cfg, imap, msg, state_root)
+                done += 1
+            except CreditExhaustedError:
+                break
         _prune_state(cfg)
     except imaplib.IMAP4.error as exc:
         print(f"IMAP error: {exc}", file=sys.stderr)
