@@ -138,30 +138,36 @@ def extract_claim(
     *,
     subject: str,
     body: str,
-    image_path: Path,
+    image_path: Path | None,
     proof_name: str,
     journals: list[str],
+    pdf_text: str = "",
 ) -> dict[str, Any]:
     api_key = os.environ.get("XAI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("missing env: XAI_API_KEY")
     model = os.environ.get("XAI_MODEL", "").strip() or DEFAULT_MODEL
-    image_b64, mime = _image_data(image_path)
     vat_journals = vat_journals_from_env()
-    prompt = _prompt(subject, body, journals, vat_journals)
+    prompt = _prompt(subject, body, journals, vat_journals, pdf_text=pdf_text)
+    content: list[dict[str, Any]] = []
+    if image_path is not None and image_path.is_file() and image_path.suffix.lower() != ".pdf":
+        image_b64, mime = _image_data(image_path)
+        content.append(
+            {
+                "type": "input_image",
+                "image_url": f"data:{mime};base64,{image_b64}",
+                "detail": "high",
+            }
+        )
+    if not content and not pdf_text.strip():
+        raise RuntimeError("nothing to extract (no image or PDF text)")
+    content.append({"type": "input_text", "text": prompt})
     payload = {
         "model": model,
         "input": [
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "input_image",
-                        "image_url": f"data:{mime};base64,{image_b64}",
-                        "detail": "high",
-                    },
-                    {"type": "input_text", "text": prompt},
-                ],
+                "content": content,
             }
         ],
     }
@@ -346,7 +352,13 @@ def _is_noise_reason(reason: str) -> bool:
     return False
 
 
-def _prompt(subject: str, body: str, journals: list[str], vat_journals: list[str] | None = None) -> str:
+def _prompt(
+    subject: str,
+    body: str,
+    journals: list[str],
+    vat_journals: list[str] | None = None,
+    pdf_text: str = "",
+) -> str:
     journal_list = ", ".join(journals) if journals else "(none configured)"
     if vat_journals is None:
         vat_journals = vat_journals_from_env()
@@ -354,7 +366,7 @@ def _prompt(subject: str, body: str, journals: list[str], vat_journals: list[str
     today = date.today().isoformat()
     return f"""You extract a South African expense claim. Return JSON only, no markdown.
 
-Use ALL of: the slip image, the email subject, and the email body (a free-text note to a clerk).
+Use ALL of: the slip/invoice image if present, any extracted PDF text, the email subject, and the email body (a free-text note to a clerk).
 Never invent amount, date, or VAT. If a value is not on the slip or in the note, use null.
 Today's date is {today}. A slip dated 2026 is not "in the future".
 
@@ -378,6 +390,9 @@ Email subject:
 
 Email body:
 {body if body.strip() else "(empty)"}
+
+PDF text:
+{pdf_text.strip() if pdf_text.strip() else "(none)"}
 
 JSON shape:
 {{

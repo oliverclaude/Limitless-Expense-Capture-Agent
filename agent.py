@@ -863,8 +863,14 @@ def run_once() -> None:
             raise
         for path in orig_paths:
             print(f"wrote: {path}")
+            pdf_text = ""
             try:
-                scan, crop_status = save_scan(path)
+                if path.suffix.lower() in PDF_SUFFIXES:
+                    from pdf_proof import prepare_pdf
+
+                    pdf_text, scan, crop_status = prepare_pdf(path)
+                else:
+                    scan, crop_status = save_scan(path)
             except CreditExhaustedError as exc:
                 print(f"crop xAI credits: {exc}", file=sys.stderr)
                 notify_xai_credits(cfg, remaining=0.0, detail=str(exc))
@@ -873,10 +879,12 @@ def run_once() -> None:
             print(f"crop: {crop_status}")
             if scan is not None:
                 print(f"wrote: {scan}")
-            image = scan if scan is not None else path
-            if image.suffix.lower() in PDF_SUFFIXES:
-                print("extract skipped (pdf not in this slice)")
-                continue
+            if scan is not None:
+                image: Path | None = scan
+            elif path.suffix.lower() in PDF_SUFFIXES:
+                image = None
+            else:
+                image = path
             try:
                 fields = extract_claim(
                     subject=subject,
@@ -884,6 +892,7 @@ def run_once() -> None:
                     image_path=image,
                     proof_name=(scan or path).name,
                     journals=journals_from_env(),
+                    pdf_text=pdf_text,
                 )
             except CreditExhaustedError as exc:
                 print(f"extract failed (credits): {exc}", file=sys.stderr)
