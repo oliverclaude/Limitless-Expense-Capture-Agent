@@ -43,7 +43,7 @@ def iter_claims(root: Path) -> list[dict[str, Any]]:
     folder = state_dir(root)
     found: list[dict[str, Any]] = []
     for path in sorted(folder.glob("*.json")):
-        if path.name == CURSOR_NAME:
+        if path.name in {CURSOR_NAME, COMMAND_CURSOR_NAME, "prepaid.json", "xai-credit-alert.json"}:
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -55,7 +55,9 @@ def iter_claims(root: Path) -> list[dict[str, Any]]:
 
 
 def awaiting(root: Path) -> list[dict[str, Any]]:
-    return [c for c in iter_claims(root) if c.get("status") == "awaiting_reply"]
+    found = [c for c in iter_claims(root) if c.get("status") == "awaiting_reply"]
+    found.sort(key=lambda c: str(c.get("updated") or ""))
+    return found
 
 
 def known_message_ids(root: Path) -> set[str]:

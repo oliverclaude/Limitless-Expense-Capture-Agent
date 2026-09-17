@@ -828,7 +828,7 @@ def announce_command_topic(cfg: dict) -> None:
 
 def process_inbox_claim(
     cfg: dict, imap: imaplib.IMAP4, msg: Message, state_root: Path
-) -> None:
+) -> str:
     import state as claim_state
     from extract import CreditExhaustedError, extract_claim, journals_from_env, notify_reasons
     from sheet import confirm_proofs
@@ -841,7 +841,7 @@ def process_inbox_claim(
         orig_paths = save_originals(msg, Path(str(cfg["expenses_root"])))
     except SystemExit:
         file_mail(imap, mid, FOLDER_FAILED)
-        return
+        return "failed"
     for path in orig_paths:
         print(f"wrote: {path}")
         pdf_text = ""
@@ -883,7 +883,7 @@ def process_inbox_claim(
         except RuntimeError as exc:
             print(f"extract failed: {exc}", file=sys.stderr)
             file_mail(imap, mid, FOLDER_FAILED)
-            return
+            return "failed"
 
         path, scan, proof_name = confirm_proofs(
             path, scan, fields.get("claim_date"), fields.get("merchant")
@@ -932,6 +932,8 @@ def process_inbox_claim(
         print(f"state: {saved}")
         print("sheet: (held until ntfy reply)")
         file_mail(imap, mid, FOLDER_REVIEW)
+        return "review"
+    return "logged"
 
 
 def run_once() -> None:
@@ -949,10 +951,12 @@ def run_once() -> None:
         state_root = Path(str(cfg["state_dir"]))
         file_known_claims(imap, state_root, cfg)
         process_ntfy_replies(cfg, imap)
-        typ, _ = imap.select("INBOX")
-        if typ != "OK":
-            print("failed to select INBOX", file=sys.stderr)
-            sys.exit(1)
+        waiting = claim_state.awaiting(state_root)
+        if waiting:
+            ids = ", ".join(str(c.get("id") or "?") for c in waiting)
+            print(f"waiting for ntfy reply on claim {ids}; not starting a new claim")
+            _prune_state(cfg)
+            return
         done = 0
         while True:
             typ, _ = imap.select("INBOX")
@@ -969,9 +973,12 @@ def run_once() -> None:
                 break
             _, msg = found
             try:
-                process_inbox_claim(cfg, imap, msg, state_root)
-                done += 1
+                outcome = process_inbox_claim(cfg, imap, msg, state_root)
             except CreditExhaustedError:
+                break
+            done += 1
+            if outcome == "review":
+                print("pass: paused for ntfy; will not take another claim until this one is done or skipped")
                 break
         _prune_state(cfg)
     except imaplib.IMAP4.error as exc:
