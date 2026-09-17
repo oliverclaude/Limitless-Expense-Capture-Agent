@@ -656,8 +656,109 @@ def _prune_state(cfg: dict) -> None:
         print(f"state: removed {cid}")
 
 
+def git_pull_home() -> None:
+    import subprocess
+
+    home = os.environ.get("AGENT_HOME", "").strip() or os.getcwd()
+    print(f"command: git pull in {home}")
+    result = subprocess.run(
+        ["git", "-C", home, "pull"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    out = (result.stdout or "") + (result.stderr or "")
+    print(out.strip() or f"git pull exit {result.returncode}")
+    if result.returncode != 0:
+        raise RuntimeError(f"git pull failed: {out.strip()[:400]}")
+
+
+def restart_service() -> None:
+    import shutil
+    import subprocess
+
+    unit = "Limitless-Expense-Capture-Agent.service"
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        raise RuntimeError("systemctl not found")
+    sudo = shutil.which("sudo")
+    commands = []
+    if sudo:
+        commands.append([sudo, "-n", systemctl, "restart", unit])
+    commands.append([systemctl, "restart", unit])
+    last = ""
+    for cmd in commands:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if proc.returncode == 0:
+            print("command: service restart requested")
+            return
+        last = (proc.stderr or proc.stdout or "").strip()
+    raise RuntimeError(
+        "restart failed (allow sudoers NOPASSWD systemctl restart "
+        f"{unit}): {last[:300]}"
+    )
+
+
+def handle_control_commands(cfg: dict) -> None:
+    from ntfy import command_topic, parse_command, poll, publish
+    import state as claim_state
+
+    url = str(cfg["ntfy_url"])
+    if not url:
+        return
+    topic = command_topic(str(cfg["ntfy_topic"]))
+    root = Path(str(cfg["state_dir"]))
+    since = claim_state.load_cursor(root, claim_state.COMMAND_CURSOR_NAME)
+    try:
+        messages = poll(url, topic, since)
+    except RuntimeError as exc:
+        print(f"command topic poll failed: {exc}", file=sys.stderr)
+        return
+    last_id = since
+    action = None
+    for item in messages:
+        last_id = str(item.get("id") or last_id or "")
+        text = str(item.get("message") or "")
+        parsed = parse_command(text)
+        if parsed:
+            action = parsed
+            print(f"command topic: {parsed}")
+    if last_id:
+        claim_state.save_cursor(root, last_id, claim_state.COMMAND_CURSOR_NAME)
+    if action == "git-pull":
+        git_pull_home()
+        restart_service()
+    elif action == "restart":
+        restart_service()
+
+
+def announce_command_topic(cfg: dict) -> None:
+    from ntfy import command_topic, publish
+    import state as claim_state
+
+    url = str(cfg["ntfy_url"])
+    if not url:
+        print("command topic: NTFY_URL empty, not announced", file=sys.stderr)
+        return
+    topic = command_topic(str(cfg["ntfy_topic"]))
+    result = publish(
+        url,
+        topic,
+        title="Limitless Expense Capture Agent",
+        message="commands here",
+    )
+    ntfy_id = str(result.get("id") or "")
+    if ntfy_id:
+        claim_state.save_cursor(
+            Path(str(cfg["state_dir"])), ntfy_id, claim_state.COMMAND_CURSOR_NAME
+        )
+    print(f"command topic: {topic}")
+
+
 def run_once() -> None:
     cfg = load_config()
+    print("pass: checking mail")
     imap: imaplib.IMAP4 | None = None
     try:
         imap = imaplib.IMAP4_SSL(str(cfg["host"]), int(cfg["port"]))
@@ -778,6 +879,12 @@ def main() -> None:
     import argparse
     import time
 
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(description="Limitless Expense Capture Agent")
     parser.add_argument(
         "--loop",
@@ -788,8 +895,15 @@ def main() -> None:
     if not args.loop:
         run_once()
         return
+    cfg = load_config()
+    print("loop: starting")
+    try:
+        announce_command_topic(cfg)
+    except Exception as exc:
+        print(f"command topic announce failed: {exc}", file=sys.stderr)
     while True:
         try:
+            handle_control_commands(cfg)
             run_once()
         except SystemExit as exc:
             if exc.code == 2:
@@ -800,6 +914,8 @@ def main() -> None:
         cfg = load_config()
         minutes = max(1, int(cfg["poll_interval_minutes"]))
         print(f"sleep: {minutes} minutes")
+        sys.stdout.flush()
+        sys.stderr.flush()
         time.sleep(minutes * 60)
 
 

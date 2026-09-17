@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 CURSOR_NAME = "ntfy-cursor.json"
+COMMAND_CURSOR_NAME = "ntfy-command-cursor.json"
 
 
 def state_dir(path: Path) -> Path:
@@ -75,8 +76,8 @@ def known_ntfy_ids(root: Path) -> set[str]:
     return ids
 
 
-def load_cursor(root: Path) -> str | None:
-    path = state_dir(root) / CURSOR_NAME
+def load_cursor(root: Path, name: str = CURSOR_NAME) -> str | None:
+    path = state_dir(root) / name
     if not path.is_file():
         return None
     try:
@@ -87,8 +88,8 @@ def load_cursor(root: Path) -> str | None:
     return str(since) if since else None
 
 
-def save_cursor(root: Path, since: str) -> None:
-    path = state_dir(root) / CURSOR_NAME
+def save_cursor(root: Path, since: str, name: str = CURSOR_NAME) -> None:
+    path = state_dir(root) / name
     path.write_text(json.dumps({"since": since}), encoding="utf-8")
 
 

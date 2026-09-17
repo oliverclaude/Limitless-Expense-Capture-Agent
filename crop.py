@@ -35,7 +35,8 @@ def straighten_slip(path: Path) -> tuple[bytes | None, str]:
         out = image
         status = "contrast-only"
     else:
-        warped = _four_point_transform(image, full_quad)
+        padded = _inflate_quad(full_quad, (h, w), 0.02)
+        warped = _four_point_transform(image, padded)
         if warped is None:
             return None, "failed (bad warp)"
         if not _acceptable(warped):
@@ -43,6 +44,7 @@ def straighten_slip(path: Path) -> tuple[bytes | None, str]:
         out = warped
         status = "warped"
 
+    out = _deskew(out)
     trimmed = _trim_to_content(out)
     if _acceptable(trimmed):
         out = trimmed
@@ -85,10 +87,12 @@ def _find_quad(proc: np.ndarray) -> np.ndarray | None:
     candidates: list[np.ndarray] = []
     candidates.extend(_contour_quads(edges, proc.shape))
     candidates.extend(_contour_quads(_adaptive_ink(blurred), proc.shape))
-    band = _text_band_quad(proc, edges)
-    if band is not None:
-        candidates.append(band)
     paper_rect = _paper_min_rect(proc, edges)
+    tilted = paper_rect is not None and _tilt_degrees(paper_rect) >= 1.5
+    if not tilted:
+        band = _text_band_quad(proc, edges)
+        if band is not None:
+            candidates.append(band)
     if paper_rect is not None:
         candidates.append(paper_rect)
 
@@ -318,6 +322,55 @@ def _quad_text_score(edges: np.ndarray, quad: np.ndarray, shape: tuple[int, ...]
 
 def _unique_pts(pts: np.ndarray) -> bool:
     return len(np.unique(np.round(pts.reshape(-1, 2), 1), axis=0)) == 4
+
+
+def _tilt_degrees(quad: np.ndarray) -> float:
+    ordered = _order_points(quad)
+    top = ordered[1] - ordered[0]
+    angle = abs(float(np.degrees(np.arctan2(top[1], top[0]))))
+    return min(angle, 180.0 - angle)
+
+
+def _inflate_quad(quad: np.ndarray, shape: tuple[int, int], frac: float) -> np.ndarray:
+    height, width = shape[:2]
+    center = quad.mean(axis=0)
+    out = center + (quad - center) * (1.0 + frac)
+    out[:, 0] = np.clip(out[:, 0], 0, width - 1)
+    out[:, 1] = np.clip(out[:, 1], 0, height - 1)
+    return out.astype(np.float32)
+
+
+def _deskew(bgr: np.ndarray) -> np.ndarray:
+    """Rotate so printed text lines run horizontally."""
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    min_len = max(40, int(0.25 * bgr.shape[1]))
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=40, minLineLength=min_len, maxLineGap=20)
+    if lines is None:
+        return bgr
+    angles: list[float] = []
+    for item in lines:
+        x1, y1, x2, y2 = item[0]
+        angle = float(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+        if abs(angle) <= 25:
+            angles.append(angle)
+    if len(angles) < 5:
+        return bgr
+    median = float(np.median(angles))
+    if abs(median) < 0.4:
+        return bgr
+    h, w = bgr.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    matrix = cv2.getRotationMatrix2D(center, median, 1.0)
+    cos = abs(matrix[0, 0])
+    sin = abs(matrix[0, 1])
+    new_w = int(h * sin + w * cos)
+    new_h = int(h * cos + w * sin)
+    matrix[0, 2] += (new_w / 2.0) - center[0]
+    matrix[1, 2] += (new_h / 2.0) - center[1]
+    fill = tuple(int(v) for v in np.median(bgr.reshape(-1, 3), axis=0))
+    return cv2.warpAffine(bgr, matrix, (new_w, new_h), flags=cv2.INTER_LINEAR, borderValue=fill)
 
 
 def _near_full_frame(pts: np.ndarray, width: int, height: int, margin: float = 0.04) -> bool:

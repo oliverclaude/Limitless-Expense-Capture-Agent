@@ -89,5 +89,20 @@ def is_our_message(item: dict[str, Any], known_ids: set[str]) -> bool:
     return LECA_PREFIX in text
 
 
+def command_topic(topic: str) -> str:
+    return f"{topic}-command"
+
+
+def parse_command(text: str) -> str | None:
+    normalized = " ".join(text.strip().lower().split()).strip(" .!")
+    if not normalized or normalized in {"commands here", "command here"}:
+        return None
+    if normalized == "restart":
+        return "restart"
+    if normalized in {"git pull", "git-pull"}:
+        return "git-pull"
+    return None
+
+
 def _header_value(value: str) -> str:
     return value.replace("\r", " ").replace("\n", " ").strip()
