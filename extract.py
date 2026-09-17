@@ -620,13 +620,11 @@ def _local_remaining(used_usd: float | None) -> float | None:
 
 
 def _ledger_path() -> Path:
+    state = os.environ.get("AGENT_STATE_DIR", "").strip() or "/g-drive/agent-state"
     explicit = os.environ.get("XAI_PREPAID_LEDGER", "").strip()
     if explicit:
-        return Path(explicit)
-    state = os.environ.get("AGENT_STATE_DIR", "").strip()
-    if state:
-        return Path(state) / "prepaid.json"
-    env_file = os.environ.get("ENV_FILE", "").strip()
-    if env_file:
-        return Path(env_file).resolve().parent / "prepaid.json"
-    return Path("/g-drive/agent-state/prepaid.json")
+        path = Path(explicit)
+        if path.is_absolute():
+            return path
+        return Path(state) / path
+    return Path(state) / "prepaid.json"
