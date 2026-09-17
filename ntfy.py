@@ -95,7 +95,11 @@ def command_topic(topic: str) -> str:
 
 def parse_command(text: str) -> str | None:
     normalized = " ".join(text.strip().lower().split()).strip(" .!")
-    if not normalized or normalized in {"commands here", "command here"}:
+    if not normalized or normalized in {
+        "commands here",
+        "command here",
+        "agent started successfully. now accepting commands here.",
+    }:
         return None
     if normalized == "restart":
         return "restart"

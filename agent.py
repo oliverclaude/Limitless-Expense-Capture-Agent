@@ -816,7 +816,7 @@ def announce_command_topic(cfg: dict) -> None:
         url,
         topic,
         title="Limitless Expense Capture Agent",
-        message="commands here",
+        message="Agent started successfully. Now accepting commands here.",
     )
     ntfy_id = str(result.get("id") or "")
     if ntfy_id:
