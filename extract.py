@@ -46,6 +46,79 @@ def ticks_to_usd(ticks: int | float | None) -> float | None:
     return float(ticks) / TICKS_PER_USD
 
 
+def slip_corners(path: Path) -> list[tuple[float, float]] | None:
+    """Ask xAI for the slip's four corners as fractions 0-1 of the EXIF-upright image."""
+    api_key = os.environ.get("XAI_API_KEY", "").strip()
+    if not api_key:
+        return None
+    model = os.environ.get("XAI_MODEL", "").strip() or DEFAULT_MODEL
+    preview, mime = _preview_jpeg(path)
+    prompt = """This photo contains a paper till slip or invoice. It may be rotated or shot at an angle.
+Return JSON only, no markdown.
+Give the four corners of the PAPER (include amounts and header; do not cut off text; exclude table/background).
+Coordinates are fractions of image width and height, 0 to 1.
+Order: top-left, top-right, bottom-right, bottom-left of the paper rectangle in the photo.
+
+{"tl": [x, y], "tr": [x, y], "br": [x, y], "bl": [x, y]}
+"""
+    payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:{mime};base64,{base64.b64encode(preview).decode('ascii')}",
+                        "detail": "high",
+                    },
+                    {"type": "input_text", "text": prompt},
+                ],
+            }
+        ],
+    }
+    data = _post_json(INFERENCE_URL, payload, api_key)
+    text = _output_text(data)
+    try:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        parsed = json.loads(match.group(0) if match else text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    points: list[tuple[float, float]] = []
+    for key in ("tl", "tr", "br", "bl"):
+        pair = parsed.get(key)
+        if not (isinstance(pair, (list, tuple)) and len(pair) == 2):
+            return None
+        try:
+            x, y = float(pair[0]), float(pair[1])
+        except (TypeError, ValueError):
+            return None
+        if not (0.0 - 0.05 <= x <= 1.05 and 0.0 - 0.05 <= y <= 1.05):
+            return None
+        points.append((min(1.0, max(0.0, x)), min(1.0, max(0.0, y))))
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    area = (max(xs) - min(xs)) * (max(ys) - min(ys))
+    if area < 0.08:
+        return None
+    return points
+
+
+def _preview_jpeg(path: Path, max_side: int = 1280) -> tuple[bytes, str]:
+    from io import BytesIO
+
+    from PIL import Image, ImageOps
+
+    with Image.open(path) as im:
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        im.thumbnail((max_side, max_side))
+        buf = BytesIO()
+        im.save(buf, format="JPEG", quality=85)
+    return buf.getvalue(), "image/jpeg"
+
+
 def extract_claim(
     *,
     subject: str,

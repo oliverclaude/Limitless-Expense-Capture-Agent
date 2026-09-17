@@ -455,10 +455,10 @@ def save_scan(orig: Path) -> tuple[Path | None, str]:
     if orig.suffix.lower() not in PHOTO_SUFFIXES:
         return None, "skipped"
     try:
-        from crop import straighten_slip
+        from crop import straighten_slip_hybrid
     except ImportError:
         return None, "failed (install: pip install -r requirements.txt)"
-    jpeg, status = straighten_slip(orig)
+    jpeg, status = straighten_slip_hybrid(orig)
     if jpeg is None:
         return None, status
     dest = scan_path_for(orig)

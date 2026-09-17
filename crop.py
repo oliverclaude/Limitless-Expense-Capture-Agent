@@ -19,6 +19,126 @@ MIN_GRAY_STD = 8.0
 MIN_TEXT_SCORE = 6.0
 
 
+def straighten_slip_hybrid(path: Path) -> tuple[bytes | None, str]:
+    """OpenCV first; xAI corners if the crop looks clipped or the box hits the photo edges."""
+    opencv_jpeg, opencv_status = straighten_slip(path)
+    if not _needs_xai_corners(path, opencv_jpeg):
+        return opencv_jpeg, opencv_status
+    try:
+        from extract import slip_corners
+    except ImportError:
+        return opencv_jpeg, opencv_status
+    try:
+        corners = slip_corners(path)
+    except RuntimeError:
+        corners = None
+    if not corners:
+        if opencv_jpeg is not None:
+            return opencv_jpeg, opencv_status
+        return None, "failed (no slip rectangle)"
+    image = _load_bgr(path)
+    if image is None:
+        if opencv_jpeg is not None:
+            return opencv_jpeg, opencv_status
+        return None, "failed (unreadable image)"
+    h, w = image.shape[:2]
+    quad = np.array([[x * w, y * h] for x, y in corners], dtype=np.float32)
+    jpeg, status = _finish_from_quad(image, quad)
+    if jpeg is None:
+        return opencv_jpeg, opencv_status if opencv_jpeg is not None else (None, status)
+    if opencv_jpeg is not None and _ink_flush_to_side(_decode_jpeg(jpeg)) and not _ink_flush_to_side(
+        _decode_jpeg(opencv_jpeg)
+    ):
+        return opencv_jpeg, opencv_status
+    return jpeg, "warped (xai)"
+
+
+def _needs_xai_corners(path: Path, opencv_jpeg: bytes | None) -> bool:
+    if opencv_jpeg is None:
+        return True
+    image = _load_bgr(path)
+    if image is None:
+        return False
+    proc, _scale = _downscale(image)
+    quad = _find_quad(proc)
+    if quad is not None and _quad_hits_opposite_borders(quad, proc.shape):
+        return True
+    decoded = _decode_jpeg(opencv_jpeg)
+    return decoded is not None and _ink_flush_to_side(decoded)
+
+
+def _quad_hits_opposite_borders(quad: np.ndarray, shape: tuple[int, ...], tol: float = 0.03) -> bool:
+    height, width = shape[:2]
+    xs, ys = quad[:, 0], quad[:, 1]
+    top = float(ys.min()) <= tol * height
+    bottom = float(ys.max()) >= (1.0 - tol) * height
+    left = float(xs.min()) <= tol * width
+    right = float(xs.max()) >= (1.0 - tol) * width
+    return (top and bottom) or (left and right)
+
+
+def _ink_flush_to_side(bgr: np.ndarray, frac: float = 0.03, thresh: float = 2.4) -> bool:
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 40, 120)
+    h, w = edges.shape
+    mx, my = max(6, int(w * frac)), max(6, int(h * frac))
+    return bool(
+        float(edges[:, :mx].mean()) > thresh
+        or float(edges[:, w - mx :].mean()) > thresh
+        or float(edges[:my, :].mean()) > thresh
+        or float(edges[h - my :, :].mean()) > thresh
+    )
+
+
+def _decode_jpeg(jpeg: bytes) -> np.ndarray | None:
+    arr = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+    return arr
+
+
+def _finish_from_quad(image: np.ndarray, quad: np.ndarray) -> tuple[bytes | None, str]:
+    h, w = image.shape[:2]
+    padded = _inflate_quad(quad, (h, w), 0.03)
+    warped = _four_point_transform(image, padded)
+    if warped is None:
+        return None, "failed (bad warp)"
+    warped = _upright_slip(warped)
+    if not _acceptable(warped):
+        return None, "failed (poor crop)"
+    out = _deskew(warped)
+    trimmed = _trim_to_content(out)
+    if _acceptable(trimmed):
+        out = trimmed
+    out = _light_contrast(out)
+    jpeg = _encode_jpeg(out)
+    if jpeg is None:
+        return None, "failed (jpeg encode)"
+    return jpeg, "warped (xai)"
+
+
+def _upright_slip(bgr: np.ndarray) -> np.ndarray:
+    if bgr.shape[0] >= bgr.shape[1] * 0.95:
+        return bgr
+    cw = cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
+    ccw = cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return cw if _horizontal_line_score(cw) >= _horizontal_line_score(ccw) else ccw
+
+
+def _horizontal_line_score(bgr: np.ndarray) -> float:
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
+    min_len = max(40, int(0.3 * bgr.shape[1]))
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=40, minLineLength=min_len, maxLineGap=16)
+    if lines is None:
+        return 0.0
+    score = 0.0
+    for item in lines:
+        x1, y1, x2, y2 = item[0]
+        angle = abs(float(np.degrees(np.arctan2(y2 - y1, x2 - x1))))
+        if angle <= 15 or abs(angle - 180) <= 15:
+            score += 1.0
+    return score
+
+
 def straighten_slip(path: Path) -> tuple[bytes | None, str]:
     image = _load_bgr(path)
     if image is None:
