@@ -274,6 +274,44 @@ Keep fields they did not change. "My half" means personal is half of the spend a
     return {"action": action, "fields": merged, "credits_used_usd": used}
 
 
+def apply_meal_entertainment(fields: dict[str, Any], journals: list[str], extra: str = "") -> dict[str, Any]:
+    """Coffee/meals/restaurant go to Entertainment even if the model picked Staff Welfare."""
+    names = {item.lower(): item for item in journals}
+    entertainment = names.get("entertainment")
+    if not entertainment:
+        return fields
+    blob = " ".join(
+        [
+            extra,
+            str(fields.get("comment") or ""),
+            str(fields.get("merchant") or ""),
+        ]
+    ).lower()
+    needles = (
+        "coffee",
+        "cafe",
+        "caff",
+        "espresso",
+        "americano",
+        "latte",
+        "cappuccino",
+        "breakfast",
+        "brunch",
+        "lunch",
+        "dinner",
+        "supper",
+        "restaurant",
+        "resto",
+        "bistro",
+        "eatery",
+        "drinks",
+        "meal",
+    )
+    if any(word in blob for word in needles):
+        fields["journal"] = entertainment
+    return fields
+
+
 def refresh_review(fields: dict[str, Any], journals: list[str]) -> dict[str, Any]:
     allowed = {item.lower(): item for item in journals}
     journal = fields.get("journal")
@@ -281,6 +319,7 @@ def refresh_review(fields: dict[str, Any], journals: list[str]) -> dict[str, Any
         fields["journal"] = allowed.get(journal.strip().lower())
     else:
         fields["journal"] = None
+    apply_meal_entertainment(fields, journals)
     reasons: list[str] = []
     if not fields.get("claim_date"):
         reasons.append("missing claim date")
@@ -371,7 +410,9 @@ Never invent amount, date, or VAT. If a value is not on the slip or in the note,
 Today's date is {today}. A slip dated 2026 is not "in the future".
 
 Rules:
-- claim_date: calendar date on the slip/invoice (YYYY-MM-DD). Not the email date unless the slip date is unreadable — then null.
+- claim_date: calendar date printed on the slip/invoice (YYYY-MM-DD). Prefer "Printed At" / "Date" on the slip. Do not use the email date. Do not use the time-of-day (07:11 is not 11 September).
+- journal: MUST be exactly one of these, or null if none fit: {journal_list}
+- Coffee, americano, cafe, breakfast, lunch, dinner, supper, restaurant, or similar meals/drinks are Entertainment — never Staff Welfare, even if the subject says Staff.
 - personal_amount: money spent from the operator's personal account.
 - company_amount: money spent from the company account.
 - If the note does not say whose account paid, the WHOLE amount is personal_amount and company_amount is 0.
@@ -381,7 +422,6 @@ Rules:
 - If the journal IS on that list, copy VAT only if printed on the slip or stated in the note. Keep that printed VAT even when a tip is added. Never calculate VAT from a rate unless the slip already shows the VAT figure.
 - currency: ZAR unless another currency is explicit.
 - comment: 2–5 words, the purpose from the subject after CLAIM: (drop leading "Slip for" / "Invoice for"). Example: "Client Drinks". Do not summarise the merchant, mall, or amounts.
-- journal: MUST be exactly one of these, or null if none fit: {journal_list}
 - needs_review: true only if amount, date, or merchant is missing, journal is null, or the note truly conflicts with the slip (not tip vs printed total).
 - confidence: high, medium, or low.
 
@@ -534,7 +574,7 @@ def _parse_fields(text: str, journals: list[str], subject: str = "") -> dict[str
     if confidence not in ("high", "medium", "low"):
         confidence = "low"
 
-    return {
+    fields = {
         "claim_date": claim_date,
         "personal_amount": personal,
         "company_amount": 0.0 if company is None and personal is not None else company,
@@ -547,6 +587,8 @@ def _parse_fields(text: str, journals: list[str], subject: str = "") -> dict[str
         "needs_review": needs,
         "review_reasons": reasons,
     }
+    apply_meal_entertainment(fields, journals, subject)
+    return fields
 
 
 def _as_number(value: Any) -> float | None:

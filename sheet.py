@@ -74,12 +74,15 @@ def write_claim_row(sheet_path: Path, fields: dict[str, Any]) -> Path:
         fields.get("proof_file") or "",
     ]
     proof = str(fields.get("proof_file") or "")
+    _compact_used_rows(ws)
     existing = _row_for_proof(ws, proof)
     if existing:
         for col, value in enumerate(row, start=1):
             ws.cell(existing, col, value)
     else:
-        ws.append(row)
+        dest = _last_used_row(ws) + 1
+        for col, value in enumerate(row, start=1):
+            ws.cell(dest, col, value)
     _atomic_save(wb, sheet_path)
     return sheet_path
 
@@ -115,10 +118,39 @@ def _ensure_header(ws: Worksheet) -> None:
             ws.cell(1, col, name)
 
 
+def _last_used_row(ws: Worksheet) -> int:
+    for row in range(ws.max_row or 1, 0, -1):
+        if any(ws.cell(row, col).value not in (None, "") for col in range(1, len(HEADERS) + 1)):
+            return row
+    return 1
+
+
+def _trim_empty_tail(ws: Worksheet) -> None:
+    last = _last_used_row(ws)
+    if (ws.max_row or 1) > last:
+        ws.delete_rows(last + 1, (ws.max_row or last) - last)
+
+
+def _compact_used_rows(ws: Worksheet) -> None:
+    used: list[list[Any]] = []
+    for row in range(1, (ws.max_row or 1) + 1):
+        vals = [ws.cell(row, col).value for col in range(1, len(HEADERS) + 1)]
+        if any(v not in (None, "") for v in vals):
+            used.append(vals)
+    if not used:
+        return
+    if ws.max_row and ws.max_row > 1:
+        ws.delete_rows(1, ws.max_row)
+    for r, vals in enumerate(used, start=1):
+        for c, value in enumerate(vals, start=1):
+            ws.cell(r, c, value)
+
+
 def _row_for_proof(ws: Worksheet, proof: str) -> int | None:
     if not proof:
         return None
-    for row in range(2, (ws.max_row or 1) + 1):
+    last = _last_used_row(ws)
+    for row in range(2, last + 1):
         if str(ws.cell(row, 7).value or "") == proof:
             return row
     return None

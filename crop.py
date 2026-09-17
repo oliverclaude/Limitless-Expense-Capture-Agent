@@ -110,6 +110,7 @@ def _finish_from_quad(image: np.ndarray, quad: np.ndarray) -> tuple[bytes | None
     trimmed = _trim_to_content(out)
     if _acceptable(trimmed):
         out = trimmed
+    out = _flip_if_upside_down(out)
     out = _light_contrast(out)
     jpeg = _encode_jpeg(out)
     if jpeg is None:
@@ -123,6 +124,21 @@ def _upright_slip(bgr: np.ndarray) -> np.ndarray:
     cw = cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
     ccw = cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
     return cw if _horizontal_line_score(cw) >= _horizontal_line_score(ccw) else ccw
+
+
+def _top_whiteness(bgr: np.ndarray, frac: float = 0.22) -> float:
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    height = max(1, int(gray.shape[0] * frac))
+    top = gray[:height]
+    return float((top > 180).mean())
+
+
+def _flip_if_upside_down(bgr: np.ndarray) -> np.ndarray:
+    """Till slips have a pale header; dense totals at the top means 180° off."""
+    rotated = cv2.rotate(bgr, cv2.ROTATE_180)
+    if _top_whiteness(rotated) > _top_whiteness(bgr) + 0.04:
+        return rotated
+    return bgr
 
 
 def _horizontal_line_score(bgr: np.ndarray) -> float:
@@ -170,6 +186,7 @@ def straighten_slip(path: Path) -> tuple[bytes | None, str]:
     trimmed = _trim_to_content(out)
     if _acceptable(trimmed):
         out = trimmed
+    out = _flip_if_upside_down(out)
     out = _light_contrast(out)
 
     jpeg = _encode_jpeg(out)
