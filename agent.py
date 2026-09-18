@@ -146,8 +146,17 @@ def load_config() -> dict[str, str | int | Path]:
             if addr.strip()
         ],
         "claim_password": os.environ.get("CLAIM_PASSWORD", ""),
-        "claim_reject_folder": _imap_folder_name(
-            os.environ.get("CLAIM_REJECT_FOLDER", "").strip() or FOLDER_REJECTED
+        "folder_processed": _imap_folder_name(
+            os.environ.get("CLAIM_FOLDER_PROCESSED", ""), FOLDER_PROCESSED
+        ),
+        "folder_review": _imap_folder_name(
+            os.environ.get("CLAIM_FOLDER_REVIEW", ""), FOLDER_REVIEW
+        ),
+        "folder_failed": _imap_folder_name(
+            os.environ.get("CLAIM_FOLDER_FAILED", ""), FOLDER_FAILED
+        ),
+        "folder_rejected": _imap_folder_name(
+            os.environ.get("CLAIM_REJECT_FOLDER", ""), FOLDER_REJECTED
         ),
     }
 
@@ -331,17 +340,27 @@ def claim_id_for(message_id: str) -> str:
     return hashlib.sha256(message_id.encode("utf-8")).hexdigest()[:8]
 
 
-def _imap_folder_name(name: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "", name.strip()) or FOLDER_REJECTED
-    return cleaned
+def _imap_folder_name(name: str, default: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "", (name or "").strip())
+    return cleaned or default
 
 
-def ensure_mail_folders(imap: imaplib.IMAP4, extra: tuple[str, ...] = ()) -> None:
-    names = list(MAIL_FOLDERS)
-    for name in extra:
-        if name and name not in names:
-            names.append(name)
+def configured_folders(cfg: dict) -> tuple[str, ...]:
+    names = [
+        str(cfg.get("folder_processed") or FOLDER_PROCESSED),
+        str(cfg.get("folder_review") or FOLDER_REVIEW),
+        str(cfg.get("folder_failed") or FOLDER_FAILED),
+        str(cfg.get("folder_rejected") or FOLDER_REJECTED),
+    ]
+    out: list[str] = []
     for name in names:
+        if name not in out:
+            out.append(name)
+    return tuple(out)
+
+
+def ensure_mail_folders(imap: imaplib.IMAP4, names: tuple[str, ...] | None = None) -> None:
+    for name in names or MAIL_FOLDERS:
         typ, data = imap.create(name)
         if typ == "OK":
             continue
@@ -392,8 +411,8 @@ def imap_move(imap: imaplib.IMAP4, uid: bytes, dest: str) -> None:
     imap.expunge()
 
 
-def file_mail(imap: imaplib.IMAP4, message_id: str, dest: str) -> None:
-    sources = ("INBOX", FOLDER_REVIEW, FOLDER_FAILED, FOLDER_REJECTED, FOLDER_PROCESSED)
+def file_mail(imap: imaplib.IMAP4, message_id: str, dest: str, cfg: dict | None = None) -> None:
+    sources = ("INBOX",) + (configured_folders(cfg) if cfg else MAIL_FOLDERS)
     if dest not in sources:
         sources = sources + (dest,)
     for box in sources:
@@ -419,7 +438,7 @@ def file_known_claims(imap: imaplib.IMAP4, root: Path, cfg: dict) -> None:
         if not isinstance(mid, str) or not mid.strip():
             continue
         if status in ("logged", "skipped"):
-            dest = FOLDER_PROCESSED
+            dest = str(cfg.get("folder_processed") or FOLDER_PROCESSED)
             if not claim.get("done_sent"):
                 try:
                     send_close_mail(
@@ -434,11 +453,11 @@ def file_known_claims(imap: imaplib.IMAP4, root: Path, cfg: dict) -> None:
                 except Exception as exc:
                     print(f"done mail failed: {exc}", file=sys.stderr)
         elif status == "awaiting_reply":
-            dest = FOLDER_REVIEW
+            dest = str(cfg.get("folder_review") or FOLDER_REVIEW)
         else:
             continue
         try:
-            file_mail(imap, mid.strip(), dest)
+            file_mail(imap, mid.strip(), dest, cfg)
         except imaplib.IMAP4.error as exc:
             print(f"mail file failed: {exc}", file=sys.stderr)
 
@@ -750,7 +769,7 @@ def process_ntfy_replies(cfg: dict, imap: imaplib.IMAP4 | None = None) -> None:
             claim_state.save_claim(root, target)
             print(f"claim {target['id']}: skipped")
             if imap is not None and mid:
-                file_mail(imap, mid, FOLDER_PROCESSED)
+                file_mail(imap, mid, str(cfg["folder_processed"]), cfg)
             pending = [c for c in pending if c["id"] != target["id"]]
             continue
         orig = Path(str(target.get("orig_path") or ""))
@@ -759,7 +778,7 @@ def process_ntfy_replies(cfg: dict, imap: imaplib.IMAP4 | None = None) -> None:
             print(f"claim {target['id']}: still needs review")
             print_extraction(fields)
             if imap is not None and mid:
-                file_mail(imap, mid, FOLDER_REVIEW)
+                file_mail(imap, mid, str(cfg["folder_review"]), cfg)
             continue
         if orig.is_file():
             finish_logged(fields, orig)
@@ -779,7 +798,7 @@ def process_ntfy_replies(cfg: dict, imap: imaplib.IMAP4 | None = None) -> None:
         print_extraction(fields)
         print(f"claim {target['id']}: logged")
         if imap is not None and mid:
-            file_mail(imap, mid, FOLDER_PROCESSED)
+            file_mail(imap, mid, str(cfg["folder_processed"]), cfg)
         pending = [c for c in pending if c["id"] != target["id"]]
     if last_id:
         claim_state.save_cursor(root, last_id)
@@ -918,11 +937,11 @@ def process_inbox_claim(
     mid = message_key(msg)
     if not sender_allowed(msg, list(cfg.get("claim_from") or [])):
         print("claim skipped: sender not on CLAIM_FROM list")
-        file_mail(imap, mid, str(cfg.get("claim_reject_folder") or FOLDER_REJECTED))
+        file_mail(imap, mid, str(cfg["folder_rejected"]), cfg)
         return "failed"
     if not body_has_password(msg, str(cfg.get("claim_password") or "")):
         print("claim skipped: body password missing")
-        file_mail(imap, mid, str(cfg.get("claim_reject_folder") or FOLDER_REJECTED))
+        file_mail(imap, mid, str(cfg["folder_rejected"]), cfg)
         return "failed"
     report(msg)
     subject = decode_mime_header(msg.get("Subject"))
@@ -930,7 +949,7 @@ def process_inbox_claim(
     try:
         orig_paths = save_originals(msg, Path(str(cfg["expenses_root"])))
     except SystemExit:
-        file_mail(imap, mid, FOLDER_FAILED)
+        file_mail(imap, mid, str(cfg["folder_failed"]), cfg)
         return "failed"
     prepared: list[dict] = []
     texts: list[str] = []
@@ -950,7 +969,7 @@ def process_inbox_claim(
         except CreditExhaustedError as exc:
             print(f"crop xAI credits: {exc}", file=sys.stderr)
             notify_xai_credits(cfg, remaining=0.0, detail=str(exc))
-            file_mail(imap, mid, FOLDER_FAILED)
+            file_mail(imap, mid, str(cfg["folder_failed"]), cfg)
             raise
         print(f"crop: {crop_status}")
         if scan is not None:
@@ -960,7 +979,7 @@ def process_inbox_claim(
         crop_notes.append(crop_status)
         prepared.append({"orig": path, "scan": scan, "text": pdf_text, "status": crop_status})
     if not prepared:
-        file_mail(imap, mid, FOLDER_FAILED)
+        file_mail(imap, mid, str(cfg["folder_failed"]), cfg)
         return "failed"
     primary = pick_primary_proof(prepared)
     extra_images = []
@@ -987,11 +1006,11 @@ def process_inbox_claim(
     except CreditExhaustedError as exc:
         print(f"extract failed (credits): {exc}", file=sys.stderr)
         notify_xai_credits(cfg, remaining=0.0, detail=str(exc))
-        file_mail(imap, mid, FOLDER_FAILED)
+        file_mail(imap, mid, str(cfg["folder_failed"]), cfg)
         raise
     except RuntimeError as exc:
         print(f"extract failed: {exc}", file=sys.stderr)
-        file_mail(imap, mid, FOLDER_FAILED)
+        file_mail(imap, mid, str(cfg["folder_failed"]), cfg)
         return "failed"
 
     for item in prepared:
@@ -1049,7 +1068,7 @@ def process_inbox_claim(
                 "done_sent": done_sent,
             },
         )
-        file_mail(imap, mid, FOLDER_PROCESSED)
+        file_mail(imap, mid, str(cfg["folder_processed"]), cfg)
         return "logged"
     claim = {
         "id": claim_id_for(mid),
@@ -1068,7 +1087,7 @@ def process_inbox_claim(
     saved = claim_state.save_claim(state_root, claim)
     print(f"state: {saved}")
     print("sheet: (held until ntfy reply)")
-    file_mail(imap, mid, FOLDER_REVIEW)
+    file_mail(imap, mid, str(cfg["folder_review"]), cfg)
     return "review"
 
 
@@ -1096,7 +1115,7 @@ def run_once() -> None:
     try:
         imap = imaplib.IMAP4_SSL(str(cfg["host"]), int(cfg["port"]))
         imap.login(str(cfg["user"]), str(cfg["password"]))
-        ensure_mail_folders(imap, extra=(str(cfg.get("claim_reject_folder") or FOLDER_REJECTED),))
+        ensure_mail_folders(imap, configured_folders(cfg))
         import state as claim_state
         from extract import CreditExhaustedError
 
