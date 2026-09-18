@@ -40,6 +40,17 @@ CONTENT_TYPE_EXT = {
 }
 
 
+def _env_optional_float(name: str) -> float | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"{name} must be a number", file=sys.stderr)
+        sys.exit(2)
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -126,6 +137,7 @@ def load_config() -> dict[str, str | int | Path]:
         not in ("0", "false", "no", "off"),
         "xai_credit_alert_usd": _env_float("XAI_CREDIT_ALERT_USD", 0.05),
         "xai_credit_alert_hours": _env_int("XAI_CREDIT_ALERT_COOLDOWN_HOURS", 6),
+        "high_value_zar": _env_optional_float("HIGH_VALUE_ZAR"),
     }
 
 
@@ -935,6 +947,17 @@ def process_inbox_claim(
         reasons = [dup_reason] + reasons
         hold_kind = "duplicate"
         print(f"duplicate: {dup_reason}")
+    threshold = cfg.get("high_value_zar")
+    if threshold is not None and hold_kind != "duplicate":
+        personal = fields.get("personal_amount") or 0
+        company = fields.get("company_amount") or 0
+        total = float(personal) + float(company)
+        if total > float(threshold):
+            reasons.append(
+                f"amount R{total:g} is over high-value threshold R{float(threshold):g}"
+            )
+            hold_kind = "high_value"
+            print(f"high value: R{total:g} > R{float(threshold):g}")
     if not reasons:
         finish_logged(fields, path)
         done_sent = False
@@ -1054,6 +1077,43 @@ def run_once() -> None:
                 pass
 
 
+def install_service(user: str, group: str) -> None:
+    import re
+    import subprocess
+
+    unit = "Limitless-Expense-Capture-Agent.service"
+    src = Path(__file__).resolve().parent / "templates" / unit
+    dest = Path("/etc/systemd/system") / unit
+    if not src.is_file():
+        print(f"missing unit template: {src}", file=sys.stderr)
+        sys.exit(1)
+    text = src.read_text(encoding="utf-8")
+    text = re.sub(r"^User=.*$", f"User={user}", text, count=1, flags=re.MULTILINE)
+    text = re.sub(r"^Group=.*$", f"Group={group}", text, count=1, flags=re.MULTILINE)
+    text = text.replace(
+        "limitless-expense-capture-agent ALL=(root) NOPASSWD:",
+        f"{user} ALL=(root) NOPASSWD:",
+    )
+    try:
+        dest.write_text(text, encoding="utf-8")
+        print(f"wrote {dest} (User={user} Group={group})")
+    except OSError as exc:
+        fallback = Path("/tmp") / unit
+        fallback.write_text(text, encoding="utf-8")
+        print(f"cannot write {dest}: {exc}", file=sys.stderr)
+        print(f"wrote {fallback}")
+        print(f"install with: sudo cp {fallback} {dest}")
+        print("then: sudo systemctl daemon-reload")
+        print(f"then: sudo systemctl enable --now {unit}")
+        sys.exit(1)
+    reload = subprocess.run(["systemctl", "daemon-reload"], capture_output=True, text=True)
+    if reload.returncode != 0:
+        print(reload.stderr.strip() or "daemon-reload failed", file=sys.stderr)
+        print(f"run: sudo systemctl daemon-reload && sudo systemctl enable --now {unit}")
+        return
+    print(f"enable and start with: sudo systemctl enable --now {unit}")
+
+
 def main() -> None:
     import argparse
     import time
@@ -1070,7 +1130,21 @@ def main() -> None:
         action="store_true",
         help="run forever, sleeping POLL_INTERVAL_MINUTES between passes",
     )
+    sub = parser.add_subparsers(dest="command")
+    install = sub.add_parser(
+        "install-service",
+        help="write the systemd unit with User/Group and copy it into place",
+    )
+    install.add_argument("--user", required=True, help="Unix user the service runs as")
+    install.add_argument(
+        "--group",
+        default="",
+        help="Unix group (defaults to --user)",
+    )
     args = parser.parse_args()
+    if args.command == "install-service":
+        install_service(args.user, args.group or args.user)
+        return
     if not args.loop:
         run_once()
         return
