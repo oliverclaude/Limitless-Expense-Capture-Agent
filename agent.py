@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sys
 import tempfile
 from datetime import datetime
@@ -12,7 +13,7 @@ from email import policy
 from email.header import decode_header, make_header
 from email.message import Message
 from email.parser import BytesParser
-from email.utils import parsedate_to_datetime
+from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
 
 import imaplib
@@ -138,6 +139,12 @@ def load_config() -> dict[str, str | int | Path]:
         "xai_credit_alert_usd": _env_float("XAI_CREDIT_ALERT_USD", 0.05),
         "xai_credit_alert_hours": _env_int("XAI_CREDIT_ALERT_COOLDOWN_HOURS", 6),
         "high_value_zar": _env_optional_float("HIGH_VALUE_ZAR"),
+        "claim_from": [
+            addr.strip().lower()
+            for addr in os.environ.get("CLAIM_FROM", "").split(",")
+            if addr.strip()
+        ],
+        "claim_password": os.environ.get("CLAIM_PASSWORD", ""),
     }
 
 
@@ -149,6 +156,46 @@ def decode_mime_header(value: str | None) -> str:
 
 def is_claim_subject(subject: str) -> bool:
     return subject.strip().lower().startswith("claim:")
+
+
+def sender_addresses(msg: Message) -> set[str]:
+    found: set[str] = set()
+    for header in ("From", "Sender", "Reply-To", "Return-Path", "Resent-From"):
+        values = msg.get_all(header) or []
+        decoded = [decode_mime_header(v) if isinstance(v, str) else str(v) for v in values]
+        for _, addr in getaddresses(decoded):
+            addr = addr.strip().strip("<>").lower()
+            if addr:
+                found.add(addr)
+    return found
+
+
+def sender_allowed(msg: Message, allowed: list[str]) -> bool:
+    if not allowed:
+        return False
+    allow = {item.lower() for item in allowed}
+    return bool(sender_addresses(msg) & allow)
+
+
+def body_has_password(msg: Message, secret: str) -> bool:
+    if not secret:
+        return False
+    if secret in text_body(msg):
+        return True
+    for part in iter_file_parts(msg):
+        ctype = (part.get_content_type() or "").lower()
+        if not ctype.startswith("text/"):
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        text = bytes(payload).decode(charset, errors="replace")
+        if secret in text:
+            return True
+        if ctype == "text/html" and secret in re.sub(r"<[^>]+>", " ", text):
+            return True
+    return False
 
 
 def fetch_part(imap: imaplib.IMAP4, seq: bytes, spec: str) -> bytes | None:
@@ -853,8 +900,16 @@ def process_inbox_claim(
     from extract import CreditExhaustedError, extract_claim, journals_from_env, notify_reasons
     from sheet import confirm_proofs
 
-    report(msg)
     mid = message_key(msg)
+    if not sender_allowed(msg, list(cfg.get("claim_from") or [])):
+        print("claim skipped: sender not on CLAIM_FROM list")
+        file_mail(imap, mid, FOLDER_FAILED)
+        return "failed"
+    if not body_has_password(msg, str(cfg.get("claim_password") or "")):
+        print("claim skipped: body password missing")
+        file_mail(imap, mid, FOLDER_FAILED)
+        return "failed"
+    report(msg)
     subject = decode_mime_header(msg.get("Subject"))
     body = text_body(msg)
     try:
