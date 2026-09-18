@@ -53,6 +53,69 @@ def month_sheet_path(month_dir: Path) -> Path:
     return month_dir / f"{month_dir.name}-Expenses.xlsx"
 
 
+AMOUNT_TOLERANCE = 0.02
+
+
+def find_duplicate(sheet_path: Path, fields: dict[str, Any]) -> dict[str, Any] | None:
+    """Same claim date, merchant slug, and personal amount within R0.02."""
+    if not sheet_path.is_file():
+        return None
+    date = str(fields.get("claim_date") or "").strip()
+    slug = merchant_slug(fields.get("merchant"))
+    amount = fields.get("personal_amount")
+    proof = str(fields.get("proof_file") or "")
+    if not date or not slug or amount is None:
+        return None
+    wb = load_workbook(sheet_path, read_only=True, data_only=True)
+    try:
+        ws = wb.active
+        if ws is None:
+            return None
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            existing_date = _as_day(row[0] if len(row) else None)
+            existing_amount = row[1] if len(row) > 1 else None
+            existing_proof = str(row[6] or "") if len(row) > 6 else ""
+            if existing_proof and proof and existing_proof == proof:
+                continue
+            if existing_date != date:
+                continue
+            try:
+                existing_num = float(existing_amount)
+            except (TypeError, ValueError):
+                continue
+            if abs(existing_num - float(amount)) > AMOUNT_TOLERANCE:
+                continue
+            proof_slug = _slug_from_proof(existing_proof)
+            if proof_slug.lower() == slug.lower():
+                return {
+                    "claim_date": existing_date,
+                    "personal": existing_num,
+                    "proof_file": existing_proof,
+                    "merchant_slug": proof_slug,
+                }
+    finally:
+        wb.close()
+    return None
+
+
+def _as_day(value: Any) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    text = str(value).strip()
+    return text[:10]
+
+
+def _slug_from_proof(filename: str) -> str:
+    stem = Path(filename).stem
+    stem = re.sub(r"_(orig|scan)(-\d+)?$", "", stem)
+    parts = stem.split("_", 1)
+    if len(parts) == 2:
+        return parts[1]
+    return stem
+
+
 def write_claim_row(sheet_path: Path, fields: dict[str, Any]) -> Path:
     sheet_path.parent.mkdir(parents=True, exist_ok=True)
     if sheet_path.is_file():

@@ -607,7 +607,7 @@ def send_review_ping(cfg: dict, claim: dict, image: Path | None) -> None:
 
 
 def process_ntfy_replies(cfg: dict, imap: imaplib.IMAP4 | None = None) -> None:
-    from extract import CreditExhaustedError, interpret_reply, journals_from_env
+    from extract import CreditExhaustedError, journals_from_env
     from ntfy import is_our_message, poll
     import state as claim_state
 
@@ -640,7 +640,15 @@ def process_ntfy_replies(cfg: dict, imap: imaplib.IMAP4 | None = None) -> None:
             continue
         print(f"ntfy reply for {target['id']}: {text}")
         try:
-            result = interpret_reply(text, dict(target.get("fields") or {}), journals)
+            from extract import interpret_duplicate_reply, interpret_reply
+
+            fields0 = dict(target.get("fields") or {})
+            if target.get("hold_kind") == "duplicate":
+                result = interpret_duplicate_reply(text, fields0)
+                if result is None:
+                    result = interpret_reply(text, fields0, journals)
+            else:
+                result = interpret_reply(text, fields0, journals)
         except CreditExhaustedError as exc:
             print(f"ntfy reply parse failed (credits): {exc}", file=sys.stderr)
             notify_xai_credits(cfg, remaining=0.0, detail=str(exc))
@@ -842,9 +850,14 @@ def process_inbox_claim(
     except SystemExit:
         file_mail(imap, mid, FOLDER_FAILED)
         return "failed"
+    prepared: list[dict] = []
+    texts: list[str] = []
+    crop_notes: list[str] = []
     for path in orig_paths:
         print(f"wrote: {path}")
         pdf_text = ""
+        scan = None
+        crop_status = ""
         try:
             if path.suffix.lower() in PDF_SUFFIXES:
                 from pdf_proof import prepare_pdf
@@ -860,80 +873,127 @@ def process_inbox_claim(
         print(f"crop: {crop_status}")
         if scan is not None:
             print(f"wrote: {scan}")
-        if scan is not None:
-            image: Path | None = scan
-        elif path.suffix.lower() in PDF_SUFFIXES:
-            image = None
-        else:
-            image = path
-        try:
-            fields = extract_claim(
-                subject=subject,
-                body=body,
-                image_path=image,
-                proof_name=(scan or path).name,
-                journals=journals_from_env(),
-                pdf_text=pdf_text,
-            )
-        except CreditExhaustedError as exc:
-            print(f"extract failed (credits): {exc}", file=sys.stderr)
-            notify_xai_credits(cfg, remaining=0.0, detail=str(exc))
-            file_mail(imap, mid, FOLDER_FAILED)
-            raise
-        except RuntimeError as exc:
-            print(f"extract failed: {exc}", file=sys.stderr)
-            file_mail(imap, mid, FOLDER_FAILED)
-            return "failed"
-
-        path, scan, proof_name = confirm_proofs(
-            path, scan, fields.get("claim_date"), fields.get("merchant")
+        if pdf_text.strip():
+            texts.append(f"--- {path.name} ---\n{pdf_text.strip()}")
+        crop_notes.append(crop_status)
+        prepared.append({"orig": path, "scan": scan, "text": pdf_text, "status": crop_status})
+    if not prepared:
+        file_mail(imap, mid, FOLDER_FAILED)
+        return "failed"
+    primary = pick_primary_proof(prepared)
+    extra_images = []
+    for item in prepared:
+        img = item["scan"] or (
+            item["orig"] if item["orig"].suffix.lower() not in PDF_SUFFIXES else None
         )
-        fields["proof_file"] = proof_name
-        print_extraction(fields)
-        maybe_alert_low_credits(cfg, fields.get("credits_left_usd"))
-        reasons = notify_reasons(fields, crop_status)
-        if not reasons:
-            finish_logged(fields, path)
-            done_sent = False
-            try:
-                send_close_mail(cfg, fields, subject=subject, message_id=mid, skipped=False)
-                done_sent = True
-            except Exception as exc:
-                print(f"done mail failed: {exc}", file=sys.stderr)
-            claim_state.save_claim(
-                state_root,
-                {
-                    "id": claim_id_for(mid),
-                    "status": "logged",
-                    "message_id": mid,
-                    "subject": subject,
-                    "fields": fields,
-                    "orig_path": str(path),
-                    "scan_path": str(scan) if scan is not None else "",
-                    "done_sent": done_sent,
-                },
-            )
-            file_mail(imap, mid, FOLDER_PROCESSED)
-            continue
-        claim = {
-            "id": claim_id_for(mid),
-            "status": "awaiting_reply",
-            "message_id": mid,
-            "subject": subject,
-            "reasons": reasons,
-            "fields": fields,
-            "orig_path": str(path),
-            "scan_path": str(scan) if scan is not None else "",
-            "ntfy_ids": [],
-        }
-        ping_image = scan if scan is not None else path
-        send_review_ping(cfg, claim, ping_image)
-        saved = claim_state.save_claim(state_root, claim)
-        print(f"state: {saved}")
-        print("sheet: (held until ntfy reply)")
-        file_mail(imap, mid, FOLDER_REVIEW)
-        return "review"
-    return "logged"
+        if img is not None and img != (primary["scan"] or primary["orig"]):
+            extra_images.append(img)
+    image = primary["scan"]
+    if image is None and primary["orig"].suffix.lower() not in PDF_SUFFIXES:
+        image = primary["orig"]
+    combined_text = "\n\n".join(texts)
+    try:
+        fields = extract_claim(
+            subject=subject,
+            body=body,
+            image_path=image,
+            proof_name=(primary["scan"] or primary["orig"]).name,
+            journals=journals_from_env(),
+            pdf_text=combined_text,
+            extra_images=extra_images,
+        )
+    except CreditExhaustedError as exc:
+        print(f"extract failed (credits): {exc}", file=sys.stderr)
+        notify_xai_credits(cfg, remaining=0.0, detail=str(exc))
+        file_mail(imap, mid, FOLDER_FAILED)
+        raise
+    except RuntimeError as exc:
+        print(f"extract failed: {exc}", file=sys.stderr)
+        file_mail(imap, mid, FOLDER_FAILED)
+        return "failed"
+
+    for item in prepared:
+        item["orig"], item["scan"], _ = confirm_proofs(
+            item["orig"], item["scan"], fields.get("claim_date"), fields.get("merchant")
+        )
+    primary = pick_primary_proof(prepared)
+    path = primary["orig"]
+    scan = primary["scan"]
+    fields["proof_file"] = (scan or path).name
+    print_extraction(fields)
+    maybe_alert_low_credits(cfg, fields.get("credits_left_usd"))
+    from sheet import find_duplicate, month_sheet_path
+
+    dup = find_duplicate(month_sheet_path(path.parent.parent), fields)
+    reasons = notify_reasons(fields, crop_notes[0] if crop_notes else "")
+    hold_kind = "review"
+    if dup:
+        dup_reason = (
+            f"possible duplicate of {dup['proof_file']} "
+            f"({dup['claim_date']} R{dup['personal']})"
+        )
+        reasons = [dup_reason] + reasons
+        hold_kind = "duplicate"
+        print(f"duplicate: {dup_reason}")
+    if not reasons:
+        finish_logged(fields, path)
+        done_sent = False
+        try:
+            send_close_mail(cfg, fields, subject=subject, message_id=mid, skipped=False)
+            done_sent = True
+        except Exception as exc:
+            print(f"done mail failed: {exc}", file=sys.stderr)
+        claim_state.save_claim(
+            state_root,
+            {
+                "id": claim_id_for(mid),
+                "status": "logged",
+                "message_id": mid,
+                "subject": subject,
+                "fields": fields,
+                "orig_path": str(path),
+                "scan_path": str(scan) if scan is not None else "",
+                "done_sent": done_sent,
+            },
+        )
+        file_mail(imap, mid, FOLDER_PROCESSED)
+        return "logged"
+    claim = {
+        "id": claim_id_for(mid),
+        "status": "awaiting_reply",
+        "hold_kind": hold_kind,
+        "message_id": mid,
+        "subject": subject,
+        "reasons": reasons,
+        "fields": fields,
+        "orig_path": str(path),
+        "scan_path": str(scan) if scan is not None else "",
+        "ntfy_ids": [],
+    }
+    ping_image = scan if scan is not None else path
+    send_review_ping(cfg, claim, ping_image if ping_image.suffix.lower() != ".pdf" else None)
+    saved = claim_state.save_claim(state_root, claim)
+    print(f"state: {saved}")
+    print("sheet: (held until ntfy reply)")
+    file_mail(imap, mid, FOLDER_REVIEW)
+    return "review"
+
+
+def pick_primary_proof(prepared: list[dict]) -> dict:
+    def score(item: dict) -> tuple[int, int]:
+        blob = f"{item['orig'].name} {item.get('text') or ''}".lower()
+        points = 0
+        if "statement" in blob or "stmt" in blob:
+            points -= 20
+        if "invoice" in blob or "tax invoice" in blob:
+            points += 20
+        if item.get("scan") is not None:
+            points += 5
+        if item["orig"].suffix.lower() not in PDF_SUFFIXES:
+            points += 2
+        return (points, 0)
+
+    return max(prepared, key=score)
 
 
 def run_once() -> None:
@@ -945,8 +1005,7 @@ def run_once() -> None:
         imap.login(str(cfg["user"]), str(cfg["password"]))
         ensure_mail_folders(imap)
         import state as claim_state
-        from extract import CreditExhaustedError, extract_claim, journals_from_env, notify_reasons
-        from sheet import confirm_proofs
+        from extract import CreditExhaustedError
 
         state_root = Path(str(cfg["state_dir"]))
         file_known_claims(imap, state_root, cfg)

@@ -142,6 +142,7 @@ def extract_claim(
     proof_name: str,
     journals: list[str],
     pdf_text: str = "",
+    extra_images: list[Path] | None = None,
 ) -> dict[str, Any]:
     api_key = os.environ.get("XAI_API_KEY", "").strip()
     if not api_key:
@@ -150,15 +151,22 @@ def extract_claim(
     vat_journals = vat_journals_from_env()
     prompt = _prompt(subject, body, journals, vat_journals, pdf_text=pdf_text)
     content: list[dict[str, Any]] = []
-    if image_path is not None and image_path.is_file() and image_path.suffix.lower() != ".pdf":
-        image_b64, mime = _image_data(image_path)
-        content.append(
-            {
-                "type": "input_image",
-                "image_url": f"data:{mime};base64,{image_b64}",
-                "detail": "high",
-            }
-        )
+    images: list[Path] = []
+    if image_path is not None:
+        images.append(image_path)
+    for extra in extra_images or []:
+        if extra not in images:
+            images.append(extra)
+    for img in images[:4]:
+        if img.is_file() and img.suffix.lower() != ".pdf":
+            image_b64, mime = _image_data(img)
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": f"data:{mime};base64,{image_b64}",
+                    "detail": "high",
+                }
+            )
     if not content and not pdf_text.strip():
         raise RuntimeError("nothing to extract (no image or PDF text)")
     content.append({"type": "input_text", "text": prompt})
@@ -184,6 +192,20 @@ def extract_claim(
 
 CONFIRM_REPLIES = {"ok", "okay", "yes", "y", "proceed", "log", "logged", "confirm", "confirmed"}
 SKIP_REPLIES = {"skip", "skipped", "ignore", "discard"}
+DUP_KEEP = {"ok", "okay", "yes", "y", "same", "duplicate", "dup", "skip", "skipped"}
+DUP_NEW = {"new", "log it", "log", "proceed", "not a duplicate", "not duplicate"}
+
+
+def interpret_duplicate_reply(reply: str, fields: dict[str, Any]) -> dict[str, Any] | None:
+    compact = re.sub(r"[.!?]+$", "", reply.strip().lower()).strip()
+    if compact in DUP_NEW:
+        updated = dict(fields)
+        updated["needs_review"] = False
+        updated["review_reasons"] = []
+        return {"action": "confirm", "fields": updated, "credits_used_usd": 0.0}
+    if compact in DUP_KEEP:
+        return {"action": "skip", "fields": fields, "credits_used_usd": 0.0}
+    return None
 
 
 def interpret_reply(reply: str, fields: dict[str, Any], journals: list[str]) -> dict[str, Any]:
