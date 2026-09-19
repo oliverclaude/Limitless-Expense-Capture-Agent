@@ -240,14 +240,17 @@ Current claim:
 {json.dumps(snapshot, default=str)}
 
 Journals they may use: {", ".join(journals) or "(none)"}
+Staff Welfare = items for the office kitchen (groceries, rusks, tea, milk, kitchen/office cleaning supplies). Entertainment = client restaurant/cafe meals, not office kitchen stock.
+
+The operator may have sent several messages. Apply EVERY instruction in the text below.
 
 Operator reply:
 {reply}
 
 Decide action:
 - skip: they do not want this logged
-- confirm: log as-is (ok, yes, looks good)
-- update: they changed a field (merchant, half, journal, amounts, date)
+- confirm: log it (ok, yes, looks good) after applying any field changes in the same text
+- update: they changed a field (merchant, half, journal, comment, amounts, date)
 
 JSON:
 {{
@@ -286,7 +289,9 @@ Keep fields they did not change. "My half" means personal is half of the spend a
         merged["merchant"] = action_obj["merchant"].strip()
     if isinstance(action_obj.get("journal"), str) and action_obj["journal"].strip():
         merged["journal"] = action_obj["journal"].strip()
-    refresh_review(merged, journals)
+    if isinstance(action_obj.get("comment"), str) and action_obj["comment"].strip():
+        merged["comment"] = action_obj["comment"].strip()
+    refresh_review(merged, journals, extra=reply)
     if action == "confirm":
         merged["needs_review"] = False
         merged["review_reasons"] = []
@@ -296,19 +301,63 @@ Keep fields they did not change. "My half" means personal is half of the spend a
     return {"action": action, "fields": merged, "credits_used_usd": used}
 
 
-def apply_meal_entertainment(fields: dict[str, Any], journals: list[str], extra: str = "") -> dict[str, Any]:
-    """Coffee/meals/restaurant go to Entertainment even if the model picked Staff Welfare."""
-    names = {item.lower(): item for item in journals}
-    entertainment = names.get("entertainment")
-    if not entertainment:
-        return fields
-    blob = " ".join(
+def _journal_blob(fields: dict[str, Any], extra: str = "") -> str:
+    return " ".join(
         [
             extra,
             str(fields.get("comment") or ""),
             str(fields.get("merchant") or ""),
         ]
     ).lower()
+
+
+def staff_welfare_hints() -> list[str]:
+    defaults = [
+        "staff welfare",
+        "office kitchen",
+        "office supplies",
+        "kitchen",
+        "rusks",
+        "grocer",
+        "grocery",
+        "groceries",
+        "cleaning",
+        "detergent",
+        "dishwasher",
+        "bleach",
+        "sponge",
+        "handy andy",
+        "domestos",
+        "sunlight",
+        "paper towel",
+        "refuse bag",
+        "bin bag",
+        "tea bag",
+        "biscuits",
+    ]
+    extra = [
+        item.strip().lower()
+        for item in os.environ.get("STAFF_WELFARE_HINTS", "").split(",")
+        if item.strip()
+    ]
+    seen = {item: True for item in extra}
+    return extra + [item for item in defaults if item not in seen]
+
+
+def looks_staff_kitchen(blob: str) -> bool:
+    text = blob.lower()
+    return any(hint in text for hint in staff_welfare_hints())
+
+
+def apply_meal_entertainment(fields: dict[str, Any], journals: list[str], extra: str = "") -> dict[str, Any]:
+    """Restaurant/cafe meals are Entertainment, unless this is office-kitchen stock."""
+    names = {item.lower(): item for item in journals}
+    entertainment = names.get("entertainment")
+    if not entertainment:
+        return fields
+    blob = _journal_blob(fields, extra)
+    if looks_staff_kitchen(blob):
+        return fields
     needles = (
         "coffee",
         "cafe",
@@ -334,14 +383,27 @@ def apply_meal_entertainment(fields: dict[str, Any], journals: list[str], extra:
     return fields
 
 
-def refresh_review(fields: dict[str, Any], journals: list[str]) -> dict[str, Any]:
+def apply_staff_welfare(fields: dict[str, Any], journals: list[str], extra: str = "") -> dict[str, Any]:
+    """Office kitchen groceries and cleaning supplies are Staff Welfare."""
+    names = {item.lower(): item for item in journals}
+    staff = names.get("staff welfare")
+    if not staff:
+        return fields
+    blob = _journal_blob(fields, extra)
+    if looks_staff_kitchen(blob):
+        fields["journal"] = staff
+    return fields
+
+
+def refresh_review(fields: dict[str, Any], journals: list[str], extra: str = "") -> dict[str, Any]:
     allowed = {item.lower(): item for item in journals}
     journal = fields.get("journal")
     if isinstance(journal, str) and journal.strip():
         fields["journal"] = allowed.get(journal.strip().lower())
     else:
         fields["journal"] = None
-    apply_meal_entertainment(fields, journals)
+    apply_meal_entertainment(fields, journals, extra)
+    apply_staff_welfare(fields, journals, extra)
     reasons: list[str] = []
     if not fields.get("claim_date"):
         reasons.append("missing claim date")
@@ -434,7 +496,8 @@ Today's date is {today}. A slip dated 2026 is not "in the future".
 Rules:
 - claim_date: calendar date printed on the slip/invoice (YYYY-MM-DD). Prefer "Printed At" / "Date" on the slip. Do not use the email date. Do not use the time-of-day (07:11 is not 11 September).
 - journal: MUST be exactly one of these, or null if none fit: {journal_list}
-- Coffee, americano, cafe, breakfast, lunch, dinner, supper, restaurant, or similar meals/drinks are Entertainment — never Staff Welfare, even if the subject says Staff.
+- Staff Welfare: anything for the office kitchen — groceries, rusks, tea, biscuits, and kitchen/office cleaning supplies. SuperSpar/Checkers shop for the kitchen is Staff Welfare, not a missing journal.
+- Entertainment: client restaurant/cafe meals and drinks, not office-kitchen stock.
 - personal_amount: money spent from the operator's personal account.
 - company_amount: money spent from the company account.
 - If the note does not say whose account paid, the WHOLE amount is personal_amount and company_amount is 0.
@@ -610,6 +673,7 @@ def _parse_fields(text: str, journals: list[str], subject: str = "") -> dict[str
         "review_reasons": reasons,
     }
     apply_meal_entertainment(fields, journals, subject)
+    apply_staff_welfare(fields, journals, subject)
     return fields
 
 

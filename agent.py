@@ -720,6 +720,7 @@ def process_ntfy_replies(cfg: dict, imap: imaplib.IMAP4 | None = None) -> None:
     known = claim_state.known_ntfy_ids(root)
     last_id = since
     journals = journals_from_env()
+    batches: dict[str, dict] = {}
     for item in messages:
         last_id = str(item.get("id") or last_id or "")
         if is_our_message(item, known):
@@ -732,16 +733,25 @@ def process_ntfy_replies(cfg: dict, imap: imaplib.IMAP4 | None = None) -> None:
             print(f"ntfy reply unmatched ({len(pending)} pending): {text[:80]}")
             continue
         print(f"ntfy reply for {target['id']}: {text}")
-        try:
-            from extract import interpret_duplicate_reply, interpret_reply
+        rec = batches.setdefault(str(target["id"]), {"target": target, "texts": []})
+        rec["target"] = target
+        rec["texts"].append(text)
+    from extract import CONFIRM_REPLIES, SKIP_REPLIES, interpret_duplicate_reply, interpret_reply
 
+    for rec in batches.values():
+        target = rec["target"]
+        texts: list[str] = rec["texts"]
+        combined = "\n".join(texts)
+        if len(texts) > 1:
+            print(f"ntfy combined {target['id']}: {len(texts)} messages")
+        try:
             fields0 = dict(target.get("fields") or {})
             if target.get("hold_kind") == "duplicate":
-                result = interpret_duplicate_reply(text, fields0)
+                result = interpret_duplicate_reply(combined, fields0)
                 if result is None:
-                    result = interpret_reply(text, fields0, journals)
+                    result = interpret_reply(combined, fields0, journals)
             else:
-                result = interpret_reply(text, fields0, journals)
+                result = interpret_reply(combined, fields0, journals)
         except CreditExhaustedError as exc:
             print(f"ntfy reply parse failed (credits): {exc}", file=sys.stderr)
             notify_xai_credits(cfg, remaining=0.0, detail=str(exc))
@@ -749,6 +759,16 @@ def process_ntfy_replies(cfg: dict, imap: imaplib.IMAP4 | None = None) -> None:
         except RuntimeError as exc:
             print(f"ntfy reply parse failed: {exc}", file=sys.stderr)
             continue
+        lines = [_compact_reply(t) for t in texts]
+        if any(line in SKIP_REPLIES for line in lines) and not any(
+            line in CONFIRM_REPLIES for line in lines
+        ):
+            result = {"action": "skip", "fields": result["fields"], "credits_used_usd": result.get("credits_used_usd")}
+        elif any(line in CONFIRM_REPLIES for line in lines):
+            fields_ok = dict(result["fields"])
+            fields_ok["needs_review"] = False
+            fields_ok["review_reasons"] = []
+            result = {"action": "confirm", "fields": fields_ok, "credits_used_usd": result.get("credits_used_usd")}
         action = result["action"]
         fields = result["fields"]
         target["fields"] = fields
@@ -802,6 +822,10 @@ def process_ntfy_replies(cfg: dict, imap: imaplib.IMAP4 | None = None) -> None:
         pending = [c for c in pending if c["id"] != target["id"]]
     if last_id:
         claim_state.save_cursor(root, last_id)
+
+
+def _compact_reply(reply: str) -> str:
+    return re.sub(r"[.!?]+$", "", reply.strip().lower()).strip()
 
 
 def _match_pending(reply: str, pending: list[dict]) -> dict | None:
