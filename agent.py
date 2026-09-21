@@ -956,7 +956,6 @@ def process_inbox_claim(
 ) -> str:
     import state as claim_state
     from extract import CreditExhaustedError, extract_claim, journals_from_env, notify_reasons
-    from sheet import confirm_proofs
 
     mid = message_key(msg)
     if not sender_allowed(msg, list(cfg.get("claim_from") or [])):
@@ -1037,17 +1036,33 @@ def process_inbox_claim(
         file_mail(imap, mid, str(cfg["folder_failed"]), cfg)
         return "failed"
 
+    from sheet import (
+        confirm_proofs,
+        find_duplicate,
+        month_sheet_path,
+        proofs_month_dir,
+        relocate_proof,
+    )
+
     for item in prepared:
         item["orig"], item["scan"], _ = confirm_proofs(
             item["orig"], item["scan"], fields.get("claim_date"), fields.get("merchant")
         )
+    expenses_root = Path(str(cfg["expenses_root"]))
+    current_month = prepared[0]["orig"].parent.parent
+    month_dir = proofs_month_dir(expenses_root, fields.get("claim_date"), current_month)
+    if month_dir.resolve() != current_month.resolve():
+        print(f"month folder: {current_month.name} -> {month_dir.name}")
+        for item in prepared:
+            item["orig"] = relocate_proof(item["orig"], month_dir)
+            if item["scan"] is not None:
+                item["scan"] = relocate_proof(item["scan"], month_dir)
     primary = pick_primary_proof(prepared)
     path = primary["orig"]
     scan = primary["scan"]
     fields["proof_file"] = (scan or path).name
     print_extraction(fields)
     maybe_alert_low_credits(cfg, fields.get("credits_left_usd"))
-    from sheet import find_duplicate, month_sheet_path
 
     dup = find_duplicate(month_sheet_path(path.parent.parent), fields)
     reasons = notify_reasons(fields, crop_notes[0] if crop_notes else "")

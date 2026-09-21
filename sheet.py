@@ -53,6 +53,25 @@ def month_sheet_path(month_dir: Path) -> Path:
     return month_dir / f"{month_dir.name}-Expenses.xlsx"
 
 
+def proofs_month_dir(expenses_root: Path, claim_date: str | None, current_month_dir: Path) -> Path:
+    """Month folder (parent of proofs/) from slip date, else email-date folder."""
+    if isinstance(claim_date, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", claim_date.strip()):
+        return expenses_root / claim_date.strip()[:7]
+    return current_month_dir
+
+
+def relocate_proof(path: Path, month_dir: Path) -> Path:
+    dest_dir = month_dir / "proofs"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / path.name
+    if dest.resolve() == path.resolve():
+        return path
+    if dest.exists():
+        dest.unlink()
+    path.replace(dest)
+    return dest
+
+
 AMOUNT_TOLERANCE = 0.02
 
 
